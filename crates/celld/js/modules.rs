@@ -609,6 +609,36 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
     out
 }
 
+fn unavailable_workflow_source(names: &std::collections::BTreeSet<String>) -> String {
+    // Export every statically requested name first so linking succeeds; the
+    // module then fails at evaluation with the capability-specific reason
+    // instead of a misleading missing-export error.
+    let mut source = String::from("const __unavailable = undefined;\n");
+    for name in names {
+        if name == "*" {
+            continue;
+        }
+        if name == "default" {
+            source.push_str("export default __unavailable;\n");
+        } else {
+            source.push_str(&format!(
+                "export {{ __unavailable as {} }};\n",
+                serde_json::to_string(name).unwrap()
+            ));
+        }
+    }
+    source.push_str(
+        "throw new Error(\"cloudflare:workflows is unavailable for Base-native execution\");\n",
+    );
+    source
+}
+
+fn workflows_enabled(scope: &mut v8::PinScope) -> bool {
+    scope
+        .get_slot::<super::LegacyProductCapabilities>()
+        .is_some_and(|products| products.workflows)
+}
+
 /// The first line of every host-generated stub.
 fn internals_import() -> String {
     format!("import __celld from {INTERNALS_SPECIFIER:?};\n")
@@ -622,6 +652,10 @@ pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
     registry.modules.lock().unwrap().clear();
     registry.trusted.lock().unwrap().clear();
     for (spec, names) in &config.main_imports {
+        if spec == "cloudflare:workflows" && !config.legacy_products().workflows {
+            register_internal_stub(scope, spec, &unavailable_workflow_source(names));
+            continue;
+        }
         install_lazy_module(scope, spec);
         // `import * as x` binds the whole namespace, so the stub's exports
         // must be the module's full surface — probed from the backing
@@ -919,7 +953,7 @@ fn builtin_source(scope: &mut v8::PinScope, spec: &str) -> Option<String> {
         return Some("__celld.__cfSockets".into());
     }
     if spec == "cloudflare:workflows" {
-        return Some("__celld.__cfWorkflows".into());
+        return workflows_enabled(scope).then(|| "__celld.__cfWorkflows".into());
     }
     if spec == PYTHON_HOST_SPECIFIER {
         return Some("__celld.__pythonHost".into());
@@ -996,6 +1030,9 @@ fn dynamic_module<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     spec: &str,
 ) -> Result<v8::Local<'s, v8::Module>> {
+    if spec == "cloudflare:workflows" && !workflows_enabled(scope) {
+        anyhow::bail!("cloudflare:workflows is unavailable for Base-native execution");
+    }
     let key = format!("dyn:{spec}");
     let registry = modreg(scope);
     let cached = registry

@@ -1834,6 +1834,40 @@ enum WorkerOrigin {
     Dynamic,
 }
 
+/// Inherited Cloudflare products that a stored deployment actually needs.
+///
+/// This is deliberately an internal execution fact rather than a manifest
+/// option or a user-selectable host mode.  New publication rejects these
+/// products; the reader still derives this value for deployments that were
+/// stored before that boundary existed.  A dynamic Worker never inherits its
+/// parent's products.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct LegacyProductCapabilities {
+    pub(super) kv: bool,
+    pub(super) d1: bool,
+    pub(super) r2: bool,
+    pub(super) queues: bool,
+    pub(super) workflows: bool,
+}
+
+impl LegacyProductCapabilities {
+    pub(super) fn any(self) -> bool {
+        self.kv || self.d1 || self.r2 || self.queues || self.workflows
+    }
+
+    fn supports_op(self, name: &str) -> bool {
+        match name {
+            "__kv_blob" => self.kv,
+            "__d1_run" => self.d1,
+            "__queue_alarm_set_wait" | "__queue_dispatch" | "__queue_policy" => self.queues,
+            "__r2_head" | "__r2_get" | "__r2_put" | "__r2_put_begin" | "__r2_put_chunk"
+            | "__r2_put_end" | "__r2_delete" | "__r2_list" | "__r2_mp_begin" | "__r2_mp_resume"
+            | "__r2_mp_part" | "__r2_mp_complete" | "__r2_mp_abort" => self.r2,
+            _ => true,
+        }
+    }
+}
+
 type ResourceLimits = crate::WorkerInvocationLimits;
 
 fn effective_resource_limits(
@@ -2073,6 +2107,39 @@ impl WorkerConfig {
             generation: 0,
             main_imports,
             module_imports,
+        }
+    }
+
+    /// The compatibility path is inferred from persisted deployment facts.
+    /// Product runtime classes matter as much as bindings: Queue consumers are
+    /// propagated across a generation, and Workflow classes are script scoped.
+    fn legacy_products(&self) -> LegacyProductCapabilities {
+        if self.origin == WorkerOrigin::Dynamic {
+            return LegacyProductCapabilities::default();
+        }
+        LegacyProductCapabilities {
+            kv: !self.kv_bindings.is_empty()
+                || self
+                    .do_classes
+                    .iter()
+                    .any(|class| class == crate::deploy::KV_CLASS),
+            d1: !self.d1_bindings.is_empty()
+                || self
+                    .do_classes
+                    .iter()
+                    .any(|class| class == crate::deploy::D1_CLASS),
+            r2: !self.r2_bindings.is_empty(),
+            queues: !self.queue_bindings.is_empty()
+                || !self.queue_consumers.is_empty()
+                || self
+                    .do_classes
+                    .iter()
+                    .any(|class| class == crate::deploy::QUEUE_CLASS),
+            workflows: !self.workflow_bindings.is_empty()
+                || self
+                    .do_classes
+                    .iter()
+                    .any(|class| crate::deploy::is_workflow_class(class)),
         }
     }
 
@@ -5836,6 +5903,7 @@ impl Worker {
         isolate.set_slot(heap_limit_state);
         isolate.set_slot(runtime_state.clone());
         isolate.set_slot(Arc::new(ModuleRegistry::default()));
+        isolate.set_slot(config.legacy_products());
         isolate.set_slot(loader_owner.clone());
         isolate.set_slot(crate::generation::GenerationTag(config.generation));
         // Retains the config so `/bundle` can project it later. Nothing is
@@ -5853,9 +5921,10 @@ impl Worker {
             let tc = std::pin::pin!(v8::TryCatch::new(cs));
             let scope = &mut tc.init();
 
-            let arguments = install_ops(scope);
+            let legacy_products = config.legacy_products();
+            let arguments = install_ops(scope, legacy_products);
             install_prelude(scope, &arguments)?; // Web Platform APIs
-            install_harness(scope, &arguments)?; // DO object model + minimal Response
+            install_harness(scope, &arguments, legacy_products)?; // core host + selected legacy products
             install_lazy_globals(scope)?;
             // A global, so it must exist before the module evaluates: bundles
             // read Cloudflare.compatibilityFlags at module scope.
@@ -5941,13 +6010,21 @@ impl Worker {
             }
             inject_namespace_keys(scope, script_name, do_classes)?;
             inject_crons(scope, &config.crons)?;
-            inject_workflows(scope, script_name, &config.workflow_bindings)?;
+            if legacy_products.workflows {
+                inject_workflows(scope, script_name, &config.workflow_bindings)?;
+            }
             inject_containers(scope, &config.containers)?;
-            inject_kv_limits(scope)?;
-            inject_queue_config(scope, &config)?;
+            if legacy_products.kv {
+                inject_kv_limits(scope)?;
+            }
+            if legacy_products.queues {
+                inject_queue_config(scope, &config)?;
+            }
             populate_cf_exports(scope, ns, do_classes)?;
             register_entrypoints(scope, ns)?;
-            validate_workflow_classes(scope, ns, &config.workflow_bindings)?;
+            if legacy_products.workflows {
+                validate_workflow_classes(scope, ns, &config.workflow_bindings)?;
+            }
             // build env from bindings and stash it in the harness
             build_env(scope, &config)?;
             // tell the harness which cells are local (route the rest cross-node)
@@ -6520,7 +6597,23 @@ impl<'s> InternalArguments<'s> {
 
 /// Build the ops, hold them on the internals object, and return them as the
 /// arguments of the bootstrap scripts. Nothing here touches the global.
-fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> InternalArguments<'s> {
+fn op_legacy_product_unavailable(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    _rv: v8::ReturnValue<v8::Value>,
+) {
+    let message = v8::String::new(
+        scope,
+        "an inherited Cloudflare product operation is unavailable for this Worker",
+    )
+    .unwrap();
+    scope.throw_exception(v8::Exception::error(scope, message));
+}
+
+fn install_ops<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    legacy_products: LegacyProductCapabilities,
+) -> InternalArguments<'s> {
     let internals = v8::Object::new(scope);
     let mut functions = Vec::new();
     install_op_functions(scope, &mut functions);
@@ -6530,8 +6623,15 @@ fn install_ops<'s>(scope: &mut v8::PinScope<'s, '_>) -> InternalArguments<'s> {
     // Read-only: a test that assigns `__celld.__op = fn`, the idiom that
     // patching a global once allowed, throws instead of binding a script that
     // compiles later to a function the bootstrap harness never saw.
+    let mut names = op_names();
     let arguments = InternalArguments::new(scope, internals, |scope, key| {
+        let name = names.next().expect("one name per op function");
         let function = functions.next().expect("one function per op name");
+        let function = if legacy_products.supports_op(name) {
+            function
+        } else {
+            v8::Function::new(scope, op_legacy_product_unavailable).unwrap()
+        };
         internals.define_own_property(
             scope,
             key.into(),

@@ -22,20 +22,21 @@ configuration rejection can be separated early; product runtime code can be
 removed only after its mixed registrations are separated and the fate of
 existing deployments/data is decided.
 
-Current status: **B304-00 through B304-02 complete** and **B304-03 through
+Current status: **B304-00 through B304-03 complete** and **B304-04 through
 B304-07 pending**. The active compatibility policy is
 [`base-native-compatibility.md`](base-native-compatibility.md).
 
-The next boundary, B304-03, separates product-specific registration from the
-reusable JavaScript-host bootstrap in `js.rs`, `js/bootstrap.rs`,
-`js/harness.js`, and `js/modules.rs`.
+B304-03 now separates product-specific registration from the reusable
+JavaScript-host bootstrap in `js.rs`, `js/bootstrap.rs`, `js/harness.js`, and
+`js/modules.rs`. The next boundary is B304-04, which may retire KV and D1 only
+after its explicit data-compatibility decision.
 
 | Slice | Objective | Prerequisites | Main files/symbols | Acceptance / rollback condition | Next |
 | --- | --- | --- | --- | --- | --- |
 | B304-00 | Freeze compatibility inventory | archive and map at B3.0.3; inspect actual fleet/installations | manifests, feature flags, reserved scopes, `_cf_*` tables, bucket prefixes | documented list of supported legacy installations; no code change | B304-01 |
 | B304-01 | Hide/remove public product CLI entrypoints | B304-00 | `main/cli.rs`, `kv_cli.rs`, `d1_cli.rs`, `r2_cli.rs`, `queue_cli.rs` registration/help/docs | `celld --help` has no product commands; Base control and normal host build pass. Roll back if an approved legacy operator flow has no migration path. | B304-02 |
 | B304-02 | Reject product declarations for new deployments | B304-00, migration policy for legacy manifests | `deploy.rs`, `protocol.rs` config/feature validation | new native install rejects KV/D1/R2/Queue/Workflow declarations precisely; existing versioned manifests retain declared compatibility behaviour or are explicitly refused before activation. | B304-03 |
-| B304-03 | Separate product registration from host bootstrap | B304-01/02 | `js.rs` op lists, `js/bootstrap.rs`, `js/harness.js`, `js/modules.rs` | generic V8 host loads a simple JS Worker and BaseDiagnostic works without product service registration. Roll back if module loading or Cell storage is coupled accidentally. | B304-04 |
+| B304-03 | Separate product registration from host bootstrap | B304-01/02 | `js.rs` op lists, `js/bootstrap.rs`, `js/harness.js`, `js/modules.rs` | **Complete.** The generic V8 host executes a real fetch without inherited product registration; stored legacy requirements select only their product registrations; native static/dynamic Workflow imports fail closed. BaseDiagnostic code remains unchanged; no multi-process acceptance claim is made. | B304-04 |
 | B304-04 | Retire KV and D1 product paths | B304-03 and product-data decision | `logic/kv.rs`, `kv_blob.rs`, `services/kv.js`, D1 blocks in `storage.rs`/harness, reserved classes/scopes | no KV/D1 classes/bindings/ops survive; Cell SQLite and alarms persist across restart. Keep archive byte checks. | B304-05 |
 | B304-05 | Retire R2 and Queue product paths | B304-03 and product-data decision | `r2_store.rs`, `js/r2_ops.rs`, `logic/queue.rs`, `queue_policy.rs`, `queue_batching.rs`, queue graph/channels | no R2/Queue binding, CLI, or reserved class survives; Bucket ownership/log replication and core scheduling still work. | B304-06 |
 | B304-06 | Retire Workflow product path | B304-03 and workflow-state decision | `deploy.rs`, `engine_api.rs`, bootstrap/modules/harness workflow symbols | no `cloudflare:workflows` or `__Workflow`; generic alarms and ordinary module loading pass. | B304-07 |

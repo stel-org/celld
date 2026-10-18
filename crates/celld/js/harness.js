@@ -780,6 +780,7 @@ __celld.__makeAssetsBinding = (script) => ({
     return response;
   },
 });
+if (__celld.__legacyProducts.r2) {
 // An `r2_buckets` binding, served out of the fleet bucket under the
 // reserved `r2/<bucketName>/` prefix. celld runs on blob storage rather
 // than providing it, so a binding gets the store the node already holds
@@ -1234,6 +1235,7 @@ __celld.__makeR2Bucket = (binding, bucketName) => ({
     return __r2Multipart(binding, bucketName, name, { value: id, host });
   },
 });
+}
 // A host timer op resolves once, so an interval arms a new one after every
 // round. `__timers` maps the id the caller holds to the op that is armed
 // right now: for a timeout that is the same id, and for an interval it is a
@@ -6005,13 +6007,20 @@ const __runtimeClass = (name, cls) => {
   __cell.doExports[name] = true;
   __runtimeClasses.add(name);
 };
-// ---- KV ------------------------------------------------------------------
+// ---- Legacy product registrations ----------------------------------------
+// Product implementations remain in this source during the compatibility
+// window, but only trusted Rust-derived capabilities execute their factories
+// or reserve their runtime classes. The shared KV service also supplies the
+// Queue sweep helper, so Queue-only legacy deployments initialise that helper
+// without registering a KV namespace.
+let __cellSweepBatch;
+if (__celld.__legacyProducts.kv || __celld.__legacyProducts.queues) {
 // The namespace cell and the binding's client are `services/kv.js`, which the
 // workerd engine runs too; this is the host they run against here.
 const {
   KvNamespaceCell: __KvNamespaceCell,
   KvNamespace: __KvNamespace,
-  cellSweepBatch: __cellSweepBatch,
+  cellSweepBatch,
 } = kvService({
   // RPC on a runtime class is granted by `__runtimeClass` below.
   DurableObject: class {
@@ -6034,11 +6043,17 @@ const {
   atob: (text) => $$atob(text, true),
 });
 
+__cellSweepBatch = cellSweepBatch;
+
+if (__celld.__legacyProducts.kv) {
 __runtimeClass("__KvNamespace", __KvNamespaceCell);
 
 const __makeKvNamespace = __celld.__makeKvNamespace = (id, cellName) =>
   new __KvNamespace(() => __cell.makeNamespace("__KvNamespace"), cellName);
+}
+}
 
+if (__celld.__legacyProducts.queues) {
 // ---- Queues --------------------------------------------------------------
 // A Queue is one runtime-supplied Durable Object. The producer binding writes
 // bytes and a content tag through RPC, and the cell owns the durable order,
@@ -7581,7 +7596,9 @@ class Queue {
 
 __celld.__makeQueue = (queue, cellName, deliveryDelay) =>
   new Queue(queue, cellName, deliveryDelay);
+}
 
+if (__celld.__legacyProducts.d1) {
 // ---- D1 -----------------------------------------------------------------
 // A D1 database is a cell of a runtime-supplied Durable Object class, so it
 // inherits ownership, fencing, LTX replication, RPO=0 acknowledgement and
@@ -7919,6 +7936,8 @@ class D1Database {
 
 const __makeD1Database = __celld.__makeD1Database =
   (databaseName) => new D1Database(databaseName);
+}
+if (__celld.__legacyProducts.workflows) {
 // ---- Workflows ----------------------------------------------------------
 // A workflow instance is one cell of the runtime-supplied `__Workflow` class,
 // named `<workflow_name>/<instance_id>` through getByName, so it inherits
@@ -9321,6 +9340,7 @@ class NonRetryableError extends Error {
 }
 // Backing object for the `cloudflare:workflows` builtin module.
 __celld.__cfWorkflows = { NonRetryableError };
+}
 // `celld:python`, imported only by the Python Worker bundle.
 __celld.__pythonHost = {
   condemnIsolate: (reason) => __isolate_condemn(String(reason)),
@@ -9537,13 +9557,13 @@ const __cf = __celld.__cf = {
   WorkerEntrypoint: class WorkerEntrypoint {
     constructor(ctx, env) { this.ctx = ctx; this.env = env; }
   },
-  // Base class for `workflows` classes. The reserved workflow cell
-  // instantiates a subclass on every replay with an ExecutionContext-shaped
-  // ctx -- never the cell's own DurableObjectState, which would hand user
-  // code the ledger that replays it.
-  WorkflowEntrypoint: class WorkflowEntrypoint {
-    constructor(ctx, env) { this.ctx = ctx; this.env = env; }
-  },
+  // Workflows are an inherited product. Its base class is intentionally not
+  // exposed by an ordinary Base-native host.
+  ...(__celld.__legacyProducts.workflows ? {
+    WorkflowEntrypoint: class WorkflowEntrypoint {
+      constructor(ctx, env) { this.ctx = ctx; this.env = env; }
+    },
+  } : {}),
   // `new RpcStub(target)` wraps any local object or function in a
   // loopback stub; the constructor returns the proxy, so instanceof
   // works through __makeStub's getPrototypeOf trap.

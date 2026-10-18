@@ -116,13 +116,20 @@ static POST_HARNESS: &[BootstrapSource] = &[
 // one external buffer in the binary and checks the ASCII requirement at
 // compile time. Compiled code and the objects created by the script remain
 // isolate-local; this shares only the original source buffer.
+//
+// KV's service is a function declaration needed by the Queue legacy path.
+// Its declaration must share a lexical scope with the harness, so the legacy
+// source puts it before the harness rather than evaluating a second script.
+// The core source contains no KV service implementation at all.
 #[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
-static HARNESS_SOURCE: v8::OneByteConst =
-    v8::String::create_external_onebyte_const(HARNESS.as_bytes());
+static CORE_HARNESS_SOURCE: v8::OneByteConst =
+    v8::String::create_external_onebyte_const(CORE_HARNESS.as_bytes());
+#[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
+static LEGACY_HARNESS_SOURCE: v8::OneByteConst =
+    v8::String::create_external_onebyte_const(LEGACY_HARNESS.as_bytes());
 
-/// The harness and the services it shares with the workerd engine, which
-/// each end in a function declaration the harness calls.
-const HARNESS: &str = concat!(include_str!("harness.js"), include_str!("services/kv.js"));
+const CORE_HARNESS: &str = include_str!("harness.js");
+const LEGACY_HARNESS: &str = concat!(include_str!("services/kv.js"), include_str!("harness.js"));
 
 fn bootstrap_code_cache() -> &'static std::sync::Mutex<BootstrapCache> {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<BootstrapCache>> =
@@ -228,7 +235,7 @@ pub(super) fn run_internal_script<'s>(
 pub(super) fn harness_source_for_test<'s>(
     scope: &mut v8::PinScope<'s, '_>,
 ) -> v8::Local<'s, v8::String> {
-    shipping_harness_source(scope)
+    shipping_harness_source(scope, LegacyProductCapabilities::default())
 }
 
 #[cfg(all(test, celld_internal_tests))]
@@ -243,8 +250,16 @@ pub(super) fn bootstrap_sources_for_test<'s>(
 }
 
 #[cfg(any(not(celld_internal_tests), all(test, celld_internal_tests)))]
-fn shipping_harness_source<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::String> {
-    v8::String::new_from_onebyte_const(scope, &HARNESS_SOURCE).expect("static harness source")
+fn shipping_harness_source<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    legacy_products: LegacyProductCapabilities,
+) -> v8::Local<'s, v8::String> {
+    let source = if legacy_products.any() {
+        &LEGACY_HARNESS_SOURCE
+    } else {
+        &CORE_HARNESS_SOURCE
+    };
+    v8::String::new_from_onebyte_const(scope, source).expect("static harness source")
 }
 
 /// WPT-conformant Web APIs: TextEncoder, URL/URLSearchParams, atob/btoa, and
@@ -262,43 +277,87 @@ pub(super) fn install_prelude<'s>(
 pub(super) fn install_harness<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     arguments: &InternalArguments<'s>,
+    legacy_products: LegacyProductCapabilities,
 ) -> Result<()> {
-    #[cfg(celld_internal_tests)]
-    let harness = HARNESS
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/",
-            "__test_workflow_event_consumed();",
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_META_CREATED__*/",
-            "__test_workflow_meta_created();",
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/",
-            "__test_workflow_terminal_alarm_set();",
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/",
-            concat!(
-                "if (globalThis.__test_workflow_pause_settle_race === true) { ",
-                "await this.__wfResume(); ",
-                "globalThis.__test_workflow_pause_settle_race = false; }"
-            ),
-        )
-        .replace(
-            "/*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/",
-            concat!(
-                "if (globalThis.__test_workflow_pause_settle_race === true) { ",
-                "await globalThis.__test_workflow_callback_started(); ",
-                "await this.__wfPause(); globalThis.__test_workflow_release(); }"
-            ),
+    // This private object is the only bridge from trusted Rust deployment
+    // facts to the shared harness source. It is not a global and user code
+    // cannot enable a product by setting an environment variable or binding.
+    let products = v8::Object::new(scope);
+    for (name, enabled) in [
+        ("kv", legacy_products.kv),
+        ("d1", legacy_products.d1),
+        ("r2", legacy_products.r2),
+        ("queues", legacy_products.queues),
+        ("workflows", legacy_products.workflows),
+    ] {
+        let key = v8::String::new(scope, name).unwrap();
+        products.define_own_property(
+            scope,
+            key.into(),
+            v8::Boolean::new(scope, enabled).into(),
+            v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
         );
+    }
+    internals(scope).define_own_property(
+        scope,
+        v8::String::new(scope, "__legacyProducts").unwrap().into(),
+        products.into(),
+        v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE,
+    );
     #[cfg(celld_internal_tests)]
-    run_bootstrap_script(scope, "harness.js", harness.as_str(), arguments)?;
+    let harness = if legacy_products.any() {
+        LEGACY_HARNESS
+    } else {
+        CORE_HARNESS
+    }
+    .replace(
+        "/*__CELLD_TEST_WORKFLOW_EVENT_CONSUMED__*/",
+        "__test_workflow_event_consumed();",
+    )
+    .replace(
+        "/*__CELLD_TEST_WORKFLOW_META_CREATED__*/",
+        "__test_workflow_meta_created();",
+    )
+    .replace(
+        "/*__CELLD_TEST_WORKFLOW_TERMINAL_ALARM_SET__*/",
+        "__test_workflow_terminal_alarm_set();",
+    )
+    .replace(
+        "/*__CELLD_TEST_WORKFLOW_BEFORE_PAUSE_SETTLE__*/",
+        concat!(
+            "if (globalThis.__test_workflow_pause_settle_race === true) { ",
+            "await this.__wfResume(); ",
+            "globalThis.__test_workflow_pause_settle_race = false; }"
+        ),
+    )
+    .replace(
+        "/*__CELLD_TEST_WORKFLOW_AFTER_RUN_STARTED__*/",
+        concat!(
+            "if (globalThis.__test_workflow_pause_settle_race === true) { ",
+            "await globalThis.__test_workflow_callback_started(); ",
+            "await this.__wfPause(); globalThis.__test_workflow_release(); }"
+        ),
+    );
+    #[cfg(celld_internal_tests)]
+    run_bootstrap_script(
+        scope,
+        if legacy_products.any() {
+            "legacy-harness.js"
+        } else {
+            "core-harness.js"
+        },
+        harness.as_str(),
+        arguments,
+    )?;
     #[cfg(not(celld_internal_tests))]
     {
-        let harness = shipping_harness_source(scope);
-        run_internal_script(scope, Some("harness.js"), harness, arguments)?;
+        let harness = shipping_harness_source(scope, legacy_products);
+        let cache = if legacy_products.any() {
+            "legacy-harness.js"
+        } else {
+            "core-harness.js"
+        };
+        run_internal_script(scope, Some(cache), harness, arguments)?;
     }
     // After the harness: both build on its EventTarget, and EventSource
     // uses its fetch and timers.
@@ -596,6 +655,7 @@ pub(super) fn inject_compatibility_flags(scope: &mut v8::PinScope, compat: Compa
 }
 
 pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Result<()> {
+    let legacy_products = config.legacy_products();
     let script_name = config.script_name.as_str();
     let bindings = config.bindings.as_slice();
     let r2_bindings = config.r2_bindings.as_slice();
@@ -615,47 +675,57 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 bname, cname
             ));
         }
-        for (name, bucket) in r2_bindings {
-            lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeR2Bucket({:?}, {:?});\n",
-                name, name, bucket
-            ));
+        if legacy_products.r2 {
+            for (name, bucket) in r2_bindings {
+                lines.push_str(&format!(
+                    "e[{:?}] = __celld.__makeR2Bucket({:?}, {:?});\n",
+                    name, name, bucket
+                ));
+            }
         }
-        for (binding, id) in kv_bindings {
-            // The cell name comes from `celld_logic::kv::cell_name`, never from
-            // the harness. It carries the shard, and while there is one shard
-            // that is a constant the binding must not be trusted to reproduce:
-            // the name is hashed into the cell scope, so a formatting
-            // disagreement would silently address a second, empty namespace
-            // rather than fail. When shards outnumber one, this becomes a name
-            // per shard and the choice moves here too.
-            lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeKvNamespace({:?}, {:?});\n",
-                binding,
-                id,
-                celld_logic::kv::cell_name(id, 0),
-            ));
+        if legacy_products.kv {
+            for (binding, id) in kv_bindings {
+                // The cell name comes from `celld_logic::kv::cell_name`, never from
+                // the harness. It carries the shard, and while there is one shard
+                // that is a constant the binding must not be trusted to reproduce:
+                // the name is hashed into the cell scope, so a formatting
+                // disagreement would silently address a second, empty namespace
+                // rather than fail. When shards outnumber one, this becomes a name
+                // per shard and the choice moves here too.
+                lines.push_str(&format!(
+                    "e[{:?}] = __celld.__makeKvNamespace({:?}, {:?});\n",
+                    binding,
+                    id,
+                    celld_logic::kv::cell_name(id, 0),
+                ));
+            }
         }
-        for binding in queue_bindings {
-            lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeQueue({:?}, {:?}, {});\n",
-                binding.environment,
-                binding.queue,
-                celld_logic::queue::cell_name(&binding.queue),
-                binding.delivery_delay,
-            ));
+        if legacy_products.queues {
+            for binding in queue_bindings {
+                lines.push_str(&format!(
+                    "e[{:?}] = __celld.__makeQueue({:?}, {:?}, {});\n",
+                    binding.environment,
+                    binding.queue,
+                    celld_logic::queue::cell_name(&binding.queue),
+                    binding.delivery_delay,
+                ));
+            }
         }
-        for (name, database) in d1_bindings {
-            lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeD1Database({:?});\n",
-                name, database
-            ));
+        if legacy_products.d1 {
+            for (name, database) in d1_bindings {
+                lines.push_str(&format!(
+                    "e[{:?}] = __celld.__makeD1Database({:?});\n",
+                    name, database
+                ));
+            }
         }
-        for binding in workflow_bindings {
-            lines.push_str(&format!(
-                "e[{:?}] = __celld.__makeWorkflow({:?});\n",
-                binding.environment, binding.workflow
-            ));
+        if legacy_products.workflows {
+            for binding in workflow_bindings {
+                lines.push_str(&format!(
+                    "e[{:?}] = __celld.__makeWorkflow({:?});\n",
+                    binding.environment, binding.workflow
+                ));
+            }
         }
         for (binding, script, entrypoint) in services {
             let entrypoint = match entrypoint {
@@ -777,7 +847,7 @@ pub(super) fn register_entrypoints(
     let key = v8::String::new(scope, "WorkflowEntrypoint").unwrap();
     let workflow_base = cf
         .get(scope, key.into())
-        .ok_or_else(|| anyhow!("missing WorkflowEntrypoint base"))?;
+        .filter(|value| !value.is_undefined());
     let Some(names) = ns.get_own_property_names(scope, Default::default()) else {
         return Ok(());
     };
@@ -807,7 +877,10 @@ pub(super) fn register_entrypoints(
         } else if call_extends(scope, extends, value, durable_base)? {
             do_exports.set(scope, name, yes.into());
             classes.set(scope, name, value);
-        } else if !call_extends(scope, extends, value, workflow_base)? {
+        } else if !match workflow_base {
+            Some(workflow_base) => call_extends(scope, extends, value, workflow_base)?,
+            None => false,
+        } {
             // Workerd processEntrypointClass(): a class that extends none of
             // the runtime bases is a Durable Object class (missingSuperclass).
             // A loaded Worker's facet class reaches `_instance` only through

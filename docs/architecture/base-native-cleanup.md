@@ -65,6 +65,28 @@ compilation/evaluation, request dispatch, cancellation, resource budgets, and
 pooling are PRESERVE. Some installed operations and harness globals are product
 specific; those are split below rather than grounds for removing the host.
 
+### B3.0.4-C host-registration boundary
+
+The active host now has a small private `LegacyProductCapabilities` description
+derived from stored Worker configuration. It distinguishes KV, D1, R2, Queue
+and Workflow requirements from the ordinary V8 host. Product registrations,
+binding construction and product-only host operations activate only when that
+trusted description requires them. Queue capability includes generation-wide
+consumer registration; a consumer-only legacy script is therefore not
+misclassified as generic. Dynamic Workers derive no inherited products.
+
+The generic host retains Request/Response, web APIs, ordinary Durable Objects,
+cell storage, generic SQL/alarm/storage operations, cancellation and module
+mechanics. Product operation names remain internal bootstrap parameters for
+stable source ordering, but invoke an explicit unavailable-operation callback
+when their product is absent. They are never globals. `cloudflare:workflows`
+is rejected for native workers for both static and dynamic imports; its legacy
+implementation remains available only when Workflow support is derived.
+
+This is a registration boundary, not code removal. KV, D1, R2, Queue and
+Workflow source remains in the binary for existing deployment compatibility;
+the subsequent B304-04 through B304-06 slices own its retirement.
+
 `Generation::build` (`generation.rs:463-...`) is the single deployment-to-live
 runtime conversion point. It builds `WorkerConfig`, starts stateless pools,
 registers cell classes, and tags isolates with a generation. General artifact
