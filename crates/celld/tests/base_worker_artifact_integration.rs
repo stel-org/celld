@@ -2,6 +2,7 @@
 
 use celld::base_worker_artifact::{
     BaseWorkerArtifact, BaseWorkerArtifactError, BaseWorkerArtifactPreparer,
+    BaseWorkerPreparationMode,
 };
 use celld::engine_api::{Compat, WorkerConfigOptions};
 use celld::js::{RequestBody, WorkerConfig};
@@ -22,6 +23,12 @@ fn init_async_runtime() {
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/base-worker-reusable")
+        .join(name)
+}
+
+fn jsr_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/base-worker-jsr")
         .join(name)
 }
 
@@ -84,6 +91,38 @@ fn missing_base_worker_executable_is_explicit_and_never_uses_path_lookup() {
         .contains("Base Worker executable unavailable"));
 }
 
+#[test]
+fn jsr_preparation_requires_an_absolute_existing_lockfile() {
+    let preparer = BaseWorkerArtifactPreparer::new("/bin/true")
+        .expect("an explicit executable may be selected before preparation");
+
+    let relative = preparer
+        .prepare_with_mode(
+            jsr_fixture("index.ts"),
+            BaseWorkerPreparationMode::JsrLocked {
+                lockfile: PathBuf::from("deno.lock"),
+            },
+        )
+        .expect_err("a relative JSR lockfile is rejected before execution");
+    assert!(matches!(
+        relative,
+        BaseWorkerArtifactError::LockfilePathNotAbsolute { .. }
+    ));
+
+    let missing = preparer
+        .prepare_with_mode(
+            jsr_fixture("index.ts"),
+            BaseWorkerPreparationMode::JsrLocked {
+                lockfile: PathBuf::from("/definitely/not/a/deno.lock"),
+            },
+        )
+        .expect_err("a missing JSR lockfile is rejected before execution");
+    assert!(matches!(
+        missing,
+        BaseWorkerArtifactError::LockfileUnavailable { .. }
+    ));
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "requires BASE_WORKER_BIN; run scripts/prove-base-worker-artifacts.sh"]
 async fn distinct_base_worker_inputs_prepare_and_execute_independently() {
@@ -115,6 +154,34 @@ async fn distinct_base_worker_inputs_prepare_and_execute_independently() {
     assert_eq!(
         execute(javascript, "/javascript").await,
         r#"{"worker":"javascript","path":"/javascript"}"#
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires BASE_WORKER_BIN and JSR registry/cache access; run scripts/prove-base-worker-jsr.sh"]
+async fn locked_jsr_dependency_prepares_and_executes_through_the_existing_host() {
+    init_v8();
+    init_async_runtime();
+    let preparer = BaseWorkerArtifactPreparer::new(worker_binary())
+        .expect("the selected Base Worker fork executable is available");
+    let artifact = preparer
+        .prepare_with_mode(
+            jsr_fixture("index.ts"),
+            BaseWorkerPreparationMode::JsrLocked {
+                lockfile: jsr_fixture("deno.lock"),
+            },
+        )
+        .expect("the selected locked JSR dependency prepares successfully");
+
+    assert!(matches!(
+        artifact.preparation_mode(),
+        BaseWorkerPreparationMode::JsrLocked { lockfile } if lockfile == &jsr_fixture("deno.lock")
+    ));
+    assert!(artifact.source().contains("function concat"));
+    assert!(!artifact.source().contains("jsr:@std/bytes@1.0.6"));
+    assert_eq!(
+        execute(artifact, "/jsr").await,
+        r#"{"message":"Hello from JSR","path":"/jsr"}"#
     );
 }
 

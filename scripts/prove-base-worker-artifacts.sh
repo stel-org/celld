@@ -33,6 +33,10 @@ printf 'Base Worker executable: %s\n' "$base_worker_bin"
 "$base_worker_bin" --version
 
 (cd "$celld_repo" && BASE_WORKER_BIN="$base_worker_bin" \
-  cargo test -p celld --test base_worker_artifact_integration -- --ignored --nocapture)
+  cargo test -p celld --test base_worker_artifact_integration \
+  distinct_base_worker_inputs_prepare_and_execute_independently -- --ignored --nocapture)
+(cd "$celld_repo" && BASE_WORKER_BIN="$base_worker_bin" \
+  cargo test -p celld --test base_worker_artifact_integration \
+  invalid_source_and_missing_import_are_preparation_failures_without_artifact_reuse -- --ignored --nocapture)
 
 printf 'Reusable Base Worker artifact proof passed\n'

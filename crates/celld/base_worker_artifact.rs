@@ -9,11 +9,26 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The deliberately bounded source-resolution policy used for one artifact.
+///
+/// `LocalOnly` preserves the B3.1.2 profile: imports must resolve from the
+/// selected local source graph. `JsrLocked` permits only JSR imports and
+/// requires an existing Deno-compatible lockfile. celld does not resolve or
+/// cache either kind of dependency; Base Worker does so in its child process.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BaseWorkerPreparationMode {
+    /// Local JavaScript or TypeScript source with no remote or npm imports.
+    LocalOnly,
+    /// JSR imports pinned by an existing Deno lockfile.
+    JsrLocked { lockfile: PathBuf },
+}
+
 /// A prepared ES module ready to become `WorkerConfigOptions::src`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BaseWorkerArtifact {
     entrypoint: PathBuf,
     executable: PathBuf,
+    preparation_mode: BaseWorkerPreparationMode,
     source: String,
     sha256: String,
     byte_len: usize,
@@ -28,6 +43,11 @@ impl BaseWorkerArtifact {
     /// The explicit Base Worker executable that produced this artifact.
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+
+    /// The bounded source-resolution policy used to prepare this artifact.
+    pub fn preparation_mode(&self) -> &BaseWorkerPreparationMode {
+        &self.preparation_mode
     }
 
     /// The generated JavaScript ES module for celld's existing Worker config.
@@ -66,6 +86,13 @@ pub enum BaseWorkerArtifactError {
     },
     EntrypointUnavailable {
         entrypoint: PathBuf,
+        reason: String,
+    },
+    LockfilePathNotAbsolute {
+        lockfile: PathBuf,
+    },
+    LockfileUnavailable {
+        lockfile: PathBuf,
         reason: String,
     },
     TemporaryArtifactDirectory {
@@ -113,6 +140,16 @@ impl fmt::Display for BaseWorkerArtifactError {
                 "Base Worker entrypoint unavailable at {}: {reason}",
                 entrypoint.display()
             ),
+            Self::LockfilePathNotAbsolute { lockfile } => write!(
+                formatter,
+                "Base Worker JSR lockfile path must be absolute: {}",
+                lockfile.display()
+            ),
+            Self::LockfileUnavailable { lockfile, reason } => write!(
+                formatter,
+                "Base Worker JSR lockfile unavailable at {}: {reason}",
+                lockfile.display()
+            ),
             Self::TemporaryArtifactDirectory { reason } => {
                 write!(formatter, "create Base Worker artifact directory: {reason}")
             }
@@ -155,7 +192,7 @@ impl std::error::Error for BaseWorkerArtifactError {}
 /// Invokes one explicitly selected Base Worker fork executable.
 ///
 /// This type never searches `PATH`, never selects a system `deno`, and keeps
-/// no artifact cache. Every [`Self::prepare`] call runs the selected entrypoint
+/// no artifact cache. Every preparation call runs the selected entrypoint
 /// through Base Worker's existing bundler and returns either that new result or
 /// a preparation error.
 #[derive(Clone, Debug)]
@@ -198,6 +235,23 @@ impl BaseWorkerArtifactPreparer {
         &self,
         entrypoint: impl Into<PathBuf>,
     ) -> Result<BaseWorkerArtifact, BaseWorkerArtifactError> {
+        self.prepare_with_mode(entrypoint, BaseWorkerPreparationMode::LocalOnly)
+    }
+
+    /// Run Base Worker's browser ESM bundler under an explicit resolution mode.
+    ///
+    /// `LocalOnly` keeps B3.1.2's remote-free behavior. `JsrLocked` delegates
+    /// the selected JSR dependency graph and cache behavior to Base Worker's
+    /// existing Deno implementation while requiring an explicit lockfile.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "This intentionally reads an external source artifact after the selected Base Worker process creates it."
+    )]
+    pub fn prepare_with_mode(
+        &self,
+        entrypoint: impl Into<PathBuf>,
+        mode: BaseWorkerPreparationMode,
+    ) -> Result<BaseWorkerArtifact, BaseWorkerArtifactError> {
         let entrypoint = entrypoint.into();
         if !entrypoint.is_absolute() {
             return Err(BaseWorkerArtifactError::EntrypointPathNotAbsolute { entrypoint });
@@ -208,6 +262,33 @@ impl BaseWorkerArtifactPreparer {
                 reason: error.to_string(),
             }
         })?;
+        let mode = match mode {
+            BaseWorkerPreparationMode::LocalOnly => BaseWorkerPreparationMode::LocalOnly,
+            BaseWorkerPreparationMode::JsrLocked { lockfile } => {
+                if !lockfile.is_absolute() {
+                    return Err(BaseWorkerArtifactError::LockfilePathNotAbsolute { lockfile });
+                }
+                let lockfile = lockfile.canonicalize().map_err(|error| {
+                    BaseWorkerArtifactError::LockfileUnavailable {
+                        lockfile: lockfile.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                let metadata = std::fs::metadata(&lockfile).map_err(|error| {
+                    BaseWorkerArtifactError::LockfileUnavailable {
+                        lockfile: lockfile.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if !metadata.is_file() {
+                    return Err(BaseWorkerArtifactError::LockfileUnavailable {
+                        lockfile,
+                        reason: "path is not a regular file".to_string(),
+                    });
+                }
+                BaseWorkerPreparationMode::JsrLocked { lockfile }
+            }
+        };
         let temporary_directory = tempfile::Builder::new()
             .prefix("celld-base-worker-artifact-")
             .tempdir()
@@ -217,17 +298,21 @@ impl BaseWorkerArtifactPreparer {
                 },
             )?;
         let artifact_path = temporary_directory.path().join("worker.js");
-        let output = Command::new(&self.executable)
-            .args([
-                "bundle",
-                "--no-config",
-                "--no-lock",
-                "--no-remote",
-                "--no-npm",
-                "--platform=browser",
-                "--format=esm",
-                "-o",
-            ])
+        let mut command = Command::new(&self.executable);
+        command.args(["bundle", "--no-config", "--no-npm"]);
+        match &mode {
+            BaseWorkerPreparationMode::LocalOnly => {
+                command.args(["--no-lock", "--no-remote"]);
+            }
+            BaseWorkerPreparationMode::JsrLocked { lockfile } => {
+                command
+                    .args(["--allow-import=jsr.io", "--lock"])
+                    .arg(lockfile)
+                    .arg("--frozen-lockfile");
+            }
+        }
+        let output = command
+            .args(["--platform=browser", "--format=esm", "-o"])
             .arg(&artifact_path)
             .arg(&entrypoint)
             .output()
@@ -268,6 +353,7 @@ impl BaseWorkerArtifactPreparer {
         Ok(BaseWorkerArtifact {
             entrypoint,
             executable: self.executable.clone(),
+            preparation_mode: mode,
             source,
             sha256,
             byte_len,

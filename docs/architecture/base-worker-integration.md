@@ -4,10 +4,11 @@
 
 B3.1.1 proved one narrow cross-repository boundary: a JavaScript ES module
 artifact produced by the `stel-org/base-worker` fork can run in celld's
-existing JavaScript host. B3.1.2 turns that proof into a reusable local
-artifact-preparation boundary. The integration uses Base Worker revision
-`a18ce33715e30cd2b0d99c7e322ef11a65490e4d` and celld revision
-`153071ce97aed598687d00b72057d8829fe9c52a` as its starting point.
+existing JavaScript host. B3.1.2 turned that proof into a reusable local
+artifact-preparation boundary. B3.1.3 extends that same boundary with one
+explicit, lockfile-bound JSR resolution mode. The integration uses Base Worker
+revision `a18ce33715e30cd2b0d99c7e322ef11a65490e4d` and starts B3.1.3 from
+celld revision `957a3a50221d0380406091936b6123a6d74b45c8`.
 
 This is an artifact boundary, not an attempt to link the two Rust runtimes.
 Base Worker currently uses its own Deno V8 facade; celld keeps its existing V8
@@ -50,6 +51,55 @@ celld host loading errors remain separate from preparation errors.
 The implementation is source-agnostic: the entrypoint is an input parameter,
 not a fixture-specific condition. Tests prove independent TypeScript and
 JavaScript entrypoints with different local dependencies and different output.
+
+## Locked JSR preparation
+
+`BaseWorkerArtifactPreparer::prepare()` remains the B3.1.2 local-only profile.
+It passes `--no-remote` and `--no-npm` to Base Worker, so accepting JSR for one
+preparation cannot silently weaken every preparation.
+
+`BaseWorkerArtifactPreparer::prepare_with_mode()` adds the deliberately narrow
+`BaseWorkerPreparationMode::JsrLocked { lockfile }` alternative. It requires
+an absolute existing Deno-compatible lockfile, canonicalizes that path, and
+records the mode with the returned artifact. It then invokes the selected Base
+Worker executable with:
+
+```sh
+deno bundle --no-config --no-npm --allow-import=jsr.io \
+  --lock /absolute/path/to/deno.lock --frozen-lockfile \
+  --platform=browser --format=esm -o /temporary/worker.js entrypoint.ts
+```
+
+This is not a celld package resolver or cache. Base Worker owns JSR registry
+access, exact-version selection, dependency-graph resolution, lockfile
+validation, and its Deno cache. celld receives only the resulting JavaScript
+as `WorkerConfigOptions::src`, exactly as it does for local artifacts.
+
+The accepted fixture is
+`crates/celld/tests/fixtures/base-worker-jsr/index.ts`. It imports the exact
+`jsr:@std/bytes@1.0.6` package and calls its `concat()` function during a real
+request. Its committed `deno.lock` selects `@std/bytes@1.0.6` and records the
+JSR integrity `f6ac6adbd8ccd99314045f5703e23af0a68d7f7e58364b47d2c7f408aeb5820a`.
+The lockfile is dependency-selection and integrity evidence; the generated
+artifact SHA-256 is only an identity for one generated JavaScript result and
+does not by itself prove dependency provenance.
+
+With an empty `DENO_DIR`, the successful proof downloaded Base Worker's
+required esbuild helper and the JSR metadata/modules, then produced a 776-byte
+artifact with SHA-256
+`fea3005b687f66cf851b1af5b0463efedc0b0b735b9a1690cb74a3f06640e703`.
+Preparing again with the same `DENO_DIR` produced byte-identical JavaScript.
+The generated artifact contains the bundled `concat` implementation and no
+`jsr:@std/bytes@1.0.6` import. celld then loaded it through the normal V8 host
+and `GET https://base.test/jsr` returned:
+
+```json
+{"message":"Hello from JSR","path":"/jsr"}
+```
+
+The output depends on `concat()` joining the two encoded message segments, so
+the response is not merely evidence that an unresolved JSR specifier was
+carried into celld.
 
 ## Responsibilities
 
@@ -129,6 +179,19 @@ tests. They prepare and execute both `typescript-worker.ts` and
 verify their separate JSON responses. Set `BASE_WORKER_BIN` to an already-built
 absolute fork binary to avoid a build; the script still refuses PATH lookup.
 
+For the JSR proof, run:
+
+```sh
+BASE_WORKER_REPO=/absolute/path/to/base-worker \
+  BASE_WORKER_BIN=/absolute/path/to/base-worker/target/debug/deno \
+  scripts/prove-base-worker-jsr.sh
+```
+
+The script uses a fresh temporary `DENO_DIR` for the initial locked preparation,
+performs the same preparation again from that cache, runs the ignored JSR test
+that sends a real request through `StatelessRuntime`, and runs the B3.1.1 and
+B3.1.2 proof scripts as regressions. It never selects a system `deno`.
+
 ## Negative coverage
 
 The proof script verifies that a missing fork executable fails without a
@@ -137,15 +200,28 @@ fixture and a fixture with a missing local import; both must fail before celld
 is invoked. The ordinary celld test suite verifies that invalid JavaScript
 submitted through `WorkerConfig` is rejected by the existing host compiler.
 
+The JSR proof additionally verifies that Base Worker rejects a nonexistent
+package and unavailable exact package version. It seeds a cache with only the
+Base Worker esbuild helper, blocks network access through an unreachable local
+proxy, then verifies that both an unlocked JSR registry attempt and a locked
+preparation with missing cached JSR modules fail. These are preparation
+failures, not celld execution failures. The underlying Deno CLI currently
+reports its generic unresolved-path diagnostic after the failed registry
+attempt; celld preserves this in `PreparationFailed` rather than relabeling it
+as a host or V8 error.
+
 ## Limitations and next step
 
-The proof does not demonstrate JSR or npm resolution, remote module fetching,
+The proof demonstrates only explicitly locked JSR imports from `jsr.io`.
+It does not demonstrate npm resolution, arbitrary remote module fetching,
 Deno-specific host APIs, `Deno.serve`, persistent Worker configuration, Base
 Project source storage, Branch ownership of executions, multiple Workers per
-Base Cell, or production serving and deployment. A JavaScript bundle is not
-full Deno-runtime compatibility.
+Base Cell, or production serving and deployment. It also does not provide an
+offline-only Deno flag: the selected Base Worker CLI does not expose
+`--cached-only` for `bundle`, so cache availability is demonstrated through a
+fresh cache and deliberately unreachable registry instead. A JavaScript bundle
+is not full Deno-runtime compatibility.
 
-B3.1.3 can build on this boundary by adding JSR resolution evidence without
-changing the artifact/execution separation. A later Base integration can own
-the persistence, authorization, and Branch/Cell semantics needed to select
-which source should be prepared and executed.
+A subsequent integration can reuse `JsrLocked` when it has product-owned
+source selection and lockfile lifecycle semantics. It must continue to keep
+Base Worker responsible for preparation and celld responsible for execution.
