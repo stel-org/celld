@@ -1749,6 +1749,7 @@ pub async fn apply_deployment(
     {
         return Err(anyhow!("control-plane deployment metadata is inconsistent"));
     }
+    crate::protocol::validate_native_publication(&deployment.manifest)?;
     validate_managed_module_envelope(deployment)?;
     validate_managed_class_migrations(&deployment.manifest)?;
     crate::protocol::validate_required_features(&deployment.manifest.required_features)?;

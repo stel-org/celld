@@ -23,12 +23,19 @@ delegates to a legacy binary automatically.
 
 ## Temporary runtime compatibility
 
-B3.0.4-A does not remove product runtime code, manifest parsing, JavaScript
-bindings, service registrations, or durable readers. Those paths remain
-compiled solely so existing deployments and their data are not silently
-broken while the removal sequence is verified. B304-02 will introduce the
-fresh-deployment configuration boundary; later slices remove product runtime
-registrations only after their dependencies are demonstrated.
+B3.0.4-A/B does not remove product runtime code, manifest parsing, JavaScript
+bindings, service registrations, or durable readers. B3.0.4-B now rejects new
+local and managed publication that declares D1, KV, R2, Queue, or Workflow
+products. Those paths remain compiled solely so existing deployments and their
+data are not silently broken while the removal sequence is verified. Later
+slices remove product runtime registrations only after their dependencies are
+demonstrated.
+
+Publication and loading are deliberately separate: `celld deploy`, `celld dev`,
+and managed publication validate new manifests with the Base-native policy;
+the existing immutable-manifest reader continues to use legacy feature and
+Queue validation. No new copy of a legacy product deployment can be published,
+but a previously stored compatible manifest remains readable.
 
 No data migration is performed in this slice. Existing durable state remains
 intact. In particular, `_cf_*` internal SQLite tables are protected

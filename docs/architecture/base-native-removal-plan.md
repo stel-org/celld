@@ -3,7 +3,7 @@
 ## Scope and safety rule
 
 This is the B3.0.4 implementation plan derived from
-`base-native-cleanup.md`. B304-00 and B304-01 are complete; later slices
+`base-native-cleanup.md`. B304-00 through B304-02 are complete; later slices
 remain pending. It removes inherited
 Cloudflare-compatible product surfaces while retaining celld's decision core,
 CellHost, actor/effect execution, JavaScript host, SQLite durability, Bucket,
@@ -22,9 +22,13 @@ configuration rejection can be separated early; product runtime code can be
 removed only after its mixed registrations are separated and the fate of
 existing deployments/data is decided.
 
-Current status: **B304-00 complete**, **B304-01 complete**, and
-**B304-02 through B304-07 pending**. The active compatibility policy is
+Current status: **B304-00 through B304-02 complete** and **B304-03 through
+B304-07 pending**. The active compatibility policy is
 [`base-native-compatibility.md`](base-native-compatibility.md).
+
+The next boundary, B304-03, separates product-specific registration from the
+reusable JavaScript-host bootstrap in `js.rs`, `js/bootstrap.rs`,
+`js/harness.js`, and `js/modules.rs`.
 
 | Slice | Objective | Prerequisites | Main files/symbols | Acceptance / rollback condition | Next |
 | --- | --- | --- | --- | --- | --- |

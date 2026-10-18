@@ -324,6 +324,85 @@ pub fn validate_required_features(required: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reject inherited Cloudflare product declarations when a deployment is about
+/// to be published by a Base-native celld. This deliberately differs from
+/// `validate_required_features`: readers use that compatibility gate for
+/// immutable manifests that may already exist in a fleet.
+pub fn validate_native_publication(manifest: &Manifest) -> anyhow::Result<()> {
+    const FORBIDDEN_FEATURES: &[&str] = &[
+        FEATURE_D1_V1,
+        FEATURE_KV_V1,
+        FEATURE_R2_V1,
+        FEATURE_QUEUES_V1,
+        FEATURE_WORKFLOWS_V1,
+    ];
+    const FORBIDDEN_BINDING_TYPES: &[&str] = &["d1", "kv", "r2_bucket", "queue", "workflow"];
+    const FORBIDDEN_METADATA_KEYS: &[&str] = &[
+        "d1_databases",
+        "kv_namespaces",
+        "r2_buckets",
+        "queues",
+        "queue_consumers",
+        "workflows",
+    ];
+
+    let metadata = manifest
+        .raw_metadata
+        .as_object()
+        .context("new publication manifest metadata must be an object")?;
+    let mut declarations = std::collections::BTreeSet::new();
+
+    for feature in &manifest.required_features {
+        if FORBIDDEN_FEATURES.contains(&feature.as_str()) {
+            declarations.insert(format!("feature `{feature}`"));
+        }
+    }
+    for key in FORBIDDEN_METADATA_KEYS {
+        if metadata.contains_key(*key) {
+            declarations.insert(format!("configuration key `{key}`"));
+        }
+    }
+    if !manifest.queue_consumers.is_empty() {
+        declarations.insert("Queue consumers".to_string());
+    }
+    for class in manifest.do_classes.iter().chain(&manifest.sqlite_classes) {
+        if class == crate::deploy::D1_CLASS
+            || class == crate::deploy::KV_CLASS
+            || class == crate::deploy::QUEUE_CLASS
+            || class == crate::deploy::WORKFLOW_CLASS
+            || crate::deploy::is_workflow_class(class)
+        {
+            declarations.insert(format!("reserved class `{class}`"));
+        }
+    }
+
+    if let Some(bindings) = metadata.get("bindings") {
+        let bindings = bindings
+            .as_array()
+            .context("new publication manifest metadata `bindings` must be an array")?;
+        for binding in bindings {
+            let binding = binding
+                .as_object()
+                .context("new publication manifest binding must be an object")?;
+            let binding_type = binding
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .context("new publication manifest binding has no string `type`")?;
+            if FORBIDDEN_BINDING_TYPES.contains(&binding_type) {
+                declarations.insert(format!("binding type `{binding_type}`"));
+            }
+        }
+    }
+
+    if !declarations.is_empty() {
+        anyhow::bail!(
+            "manifest declares unsupported Base-native product declarations: {}",
+            declarations.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleRef {
     pub name: String,

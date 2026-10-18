@@ -63,6 +63,18 @@ const SUPPORTED_KEYS: &[&str] = &[
     "rules",
 ];
 
+/// Inherited Cloudflare product declarations that new Base-native deployments
+/// must not publish. They remain in `SUPPORTED_KEYS` temporarily so the guard
+/// can give a precise policy error instead of presenting them as unknown
+/// configuration syntax.
+const BASE_NATIVE_FORBIDDEN_PRODUCT_KEYS: &[&str] = &[
+    "d1_databases",
+    "kv_namespaces",
+    "r2_buckets",
+    "queues",
+    "workflows",
+];
+
 /// The Durable Object class every D1 database runs as. It is supplied by the
 /// runtime, not by the worker, so a config naming it in `durable_objects` or
 /// `migrations` is refused: the harness registers this class in every isolate,
@@ -743,6 +755,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         },
         raw_metadata: project.metadata,
     };
+    crate::protocol::validate_native_publication(&manifest)?;
     Ok(Built {
         script_name: project.script_name,
         version,
@@ -879,6 +892,7 @@ async fn ensure_image_tar(bucket: &Bucket, image: &str) -> anyhow::Result<()> {
 }
 
 pub async fn write(bucket: &Bucket, built: &Built) -> anyhow::Result<()> {
+    crate::protocol::validate_native_publication(&built.manifest)?;
     // Read every attachment before uploading immutable deployment objects.
     // A competing consumer is a deploy refusal, so it must not leave a new
     // version in the bucket that an operator can mistake for a published one.
@@ -1303,6 +1317,18 @@ fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::R
             "`celld deploy` does not support these config keys: {}.\n\
              Deploy this project with Wrangler instead, or remove them.",
             unsupported.join(", ")
+        );
+    }
+
+    let prohibited = BASE_NATIVE_FORBIDDEN_PRODUCT_KEYS
+        .iter()
+        .filter(|key| object.contains_key(**key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !prohibited.is_empty() {
+        bail!(
+            "configuration declares unsupported Base-native product keys: {}",
+            prohibited.join(", ")
         );
     }
 
