@@ -76,6 +76,10 @@ Put `~/.local/bin` on your `PATH` if the installer asks you to.
 Worker projects deployed with `celld deploy` need
 [esbuild](https://esbuild.github.io) on `PATH`; asset-only projects do not.
 
+The repository also contains [`examples/base-diagnostic`](examples/base-diagnostic),
+a fixed Durable Object used only by Base's B2.3 local integration validation.
+It is not a general Base or celld execution-management API.
+
 The installer keeps each release under `~/.local/lib/celld/releases` and points
 one symlink at the current one. To remove celld, delete the symlink and the
 releases:

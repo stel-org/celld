@@ -4,11 +4,14 @@
 //! operation.  When enabled, it binds a Unix-domain socket in an explicitly
 //! configured private directory and answers one authenticated readiness probe.
 
-use crate::actor::AppHandle;
+use crate::actor::{AppHandle, LocalRequestFailure, Routed};
+use crate::engine_api::{RequestBody, RuntimeFetch};
 use anyhow::{bail, Context};
+use bytes::Bytes;
+use celld_logic::Route;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
@@ -25,6 +28,8 @@ const PROTOCOL: &str = "base-celld";
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const DIAGNOSTIC_CLASS: &str = "BaseDiagnostic";
+const MAX_DIAGNOSTIC_RESPONSE_BYTES: usize = 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -57,6 +62,17 @@ struct ProbeRequest {
     proof: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExecutionRequest {
+    operation: String,
+    protocol: String,
+    protocol_version: u32,
+    cell_id: String,
+    nonce: String,
+    proof: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProbeResponse<'a> {
@@ -73,6 +89,24 @@ struct ProbeResponse<'a> {
 #[derive(Serialize)]
 struct Rejection<'a> {
     error: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionResponse<'a> {
+    operation: &'static str,
+    protocol: &'static str,
+    protocol_version: u32,
+    installation_id: &'a str,
+    implementation: &'static str,
+    implementation_version: &'static str,
+    cell_id: &'a str,
+    scope: &'a str,
+    outcome: &'static str,
+    status: Option<u16>,
+    body: Option<&'a str>,
+    nonce: &'a str,
+    proof: String,
 }
 
 /// Starts the optional Base integration boundary selected by
@@ -97,7 +131,7 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
             // bounded before another local probe can be accepted.
             let _ = tokio::time::timeout(
                 REQUEST_TIMEOUT,
-                handle_probe(
+                handle_control(
                     stream,
                     app.clone(),
                     &control.installation_id,
@@ -259,14 +293,21 @@ fn validate_installation_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_probe(
+async fn handle_control(
     mut stream: UnixStream,
     app: AppHandle,
     installation_id: &str,
     secret: &[u8],
 ) -> anyhow::Result<()> {
     let body = read_message(&mut stream).await?;
-    let request: ProbeRequest = match serde_json::from_slice(&body) {
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => return Ok(()),
+    };
+    if value.get("operation").is_some() {
+        return handle_execution(stream, app, installation_id, secret, value).await;
+    }
+    let request: ProbeRequest = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => return Ok(()),
     };
@@ -311,6 +352,144 @@ async fn handle_probe(
     write_json(&mut stream, &response).await
 }
 
+async fn handle_execution(
+    mut stream: UnixStream,
+    app: AppHandle,
+    installation_id: &str,
+    secret: &[u8],
+    value: serde_json::Value,
+) -> anyhow::Result<()> {
+    let request: ExecutionRequest = match serde_json::from_value(value) {
+        Ok(request) => request,
+        Err(_) => return Ok(()),
+    };
+    if !matches!(
+        request.operation.as_str(),
+        "executeDiagnostic" | "evictDiagnostic"
+    ) || request.protocol != PROTOCOL
+        || request.protocol_version != PROTOCOL_VERSION
+        || !valid_nonce(&request.nonce)
+        || !valid_cell_id(&request.cell_id)
+        || !verify(
+            secret,
+            &execution_request_material(&request.operation, &request.cell_id, &request.nonce),
+            &request.proof,
+        )
+    {
+        write_json(
+            &mut stream,
+            &Rejection {
+                error: "authentication_rejected",
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let scope = format!("{DIAGNOSTIC_CLASS}:{}", request.cell_id);
+    let (outcome, status, body) = match request.operation.as_str() {
+        "executeDiagnostic" => match execute_diagnostic(&app, scope.clone()).await {
+            Ok((status, body)) => ("executed", Some(status), Some(body)),
+            Err(error) => {
+                tracing::warn!(%scope, error = %error, "Base diagnostic execution refused");
+                ("execution_refused", None, None)
+            }
+        },
+        "evictDiagnostic" => match app.evict(scope.clone()).await {
+            Ok(celld_logic::EvictSuccess::Evicted) => ("evicted", None, None),
+            Ok(celld_logic::EvictSuccess::AlreadyAbsent) => ("already_absent", None, None),
+            Err(error) => {
+                tracing::warn!(%scope, kind = error.kind(), reason = error.reason(), "Base diagnostic eviction refused");
+                ("eviction_refused", None, None)
+            }
+        },
+        _ => unreachable!("operation was validated"),
+    };
+    let response = ExecutionResponse {
+        operation: match request.operation.as_str() {
+            "executeDiagnostic" => "executeDiagnostic",
+            "evictDiagnostic" => "evictDiagnostic",
+            _ => unreachable!("operation was validated"),
+        },
+        protocol: PROTOCOL,
+        protocol_version: PROTOCOL_VERSION,
+        installation_id,
+        implementation: "celld",
+        implementation_version: env!("CARGO_PKG_VERSION"),
+        cell_id: &request.cell_id,
+        scope: &scope,
+        outcome,
+        status,
+        body: body.as_deref(),
+        nonce: &request.nonce,
+        proof: sign(
+            secret,
+            &execution_response_material(
+                &request.operation,
+                installation_id,
+                env!("CARGO_PKG_VERSION"),
+                &request.cell_id,
+                &scope,
+                outcome,
+                status,
+                body.as_deref(),
+                &request.nonce,
+            ),
+        ),
+    };
+    write_json(&mut stream, &response).await
+}
+
+async fn execute_diagnostic(app: &AppHandle, scope: String) -> anyhow::Result<(u16, String)> {
+    let Routed { request, route } = app
+        .request(scope.clone())
+        .await
+        .map_err(|error| anyhow::anyhow!("actor refused diagnostic route: {error:?}"))?;
+    anyhow::ensure!(route == Route::Local, "diagnostic execution is not local");
+    let local = app.local_request(request, scope.clone(), None, "base_control");
+    let completed = local
+        .run(async {
+            let host = app
+                .execution_host()
+                .context("celld has no execution runtime")?;
+            host.fetch_cell(
+                scope,
+                None,
+                RuntimeFetch {
+                    url: "http://base-control/diagnostic".to_owned(),
+                    method: "GET".to_owned(),
+                    body: RequestBody::Bytes(Bytes::new()),
+                    headers: Vec::new(),
+                    request_id: None,
+                    order: None,
+                    parent: None,
+                },
+                None,
+            )
+            .await
+        })
+        .await;
+    let response = match completed.result {
+        Ok(response) => response,
+        Err(LocalRequestFailure::Handler(error)) => return Err(error),
+        Err(LocalRequestFailure::OutputGate { verdict, handler }) => {
+            return Err(
+                handler.unwrap_or_else(|| anyhow::anyhow!("output gate refused: {verdict:?}"))
+            )
+        }
+    };
+    anyhow::ensure!(
+        response.stream.is_none() && response.websocket.is_none(),
+        "diagnostic response must be buffered HTTP"
+    );
+    anyhow::ensure!(
+        response.body.len() <= MAX_DIAGNOSTIC_RESPONSE_BYTES,
+        "diagnostic response exceeds its maximum size"
+    );
+    let body = String::from_utf8(response.body).context("diagnostic response is not UTF-8")?;
+    Ok((response.status, body))
+}
+
 async fn read_message(stream: &mut UnixStream) -> anyhow::Result<Vec<u8>> {
     let mut body = Vec::with_capacity(256);
     loop {
@@ -346,6 +525,17 @@ fn valid_nonce(nonce: &str) -> bool {
     nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_cell_id(value: &str) -> bool {
+    value.len() == 36
+        && value.as_bytes().iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 fn request_material(nonce: &str) -> String {
     format!("request:{PROTOCOL}:{PROTOCOL_VERSION}:{nonce}")
 }
@@ -358,6 +548,33 @@ fn response_material(
 ) -> String {
     format!(
         "response:{PROTOCOL}:{PROTOCOL_VERSION}:{installation_id}:celld:{implementation_version}:{readiness}:{nonce}"
+    )
+}
+
+fn execution_request_material(operation: &str, cell_id: &str, nonce: &str) -> String {
+    format!("execution:{PROTOCOL}:{PROTOCOL_VERSION}:{operation}:{cell_id}:{nonce}")
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signed wire contract names every independently authenticated response field"
+)]
+fn execution_response_material(
+    operation: &str,
+    installation_id: &str,
+    implementation_version: &str,
+    cell_id: &str,
+    scope: &str,
+    outcome: &str,
+    status: Option<u16>,
+    body: Option<&str>,
+    nonce: &str,
+) -> String {
+    let body = body.unwrap_or("");
+    format!(
+        "execution-response:{PROTOCOL}:{PROTOCOL_VERSION}:{operation}:{installation_id}:celld:{implementation_version}:{cell_id}:{scope}:{outcome}:{}:{}:{nonce}",
+        status.map_or_else(String::new, |status| status.to_string()),
+        hex::encode(sha2::Sha256::digest(body.as_bytes())),
     )
 }
 
@@ -405,5 +622,35 @@ mod tests {
     fn installation_identity_is_strictly_shaped() {
         assert!(validate_installation_id("01234567-89ab-cdef-0123-456789abcdef").is_ok());
         assert!(validate_installation_id("not-an-installation-id").is_err());
+    }
+
+    #[test]
+    fn execution_proof_is_bound_to_the_fixed_operation_and_cell() {
+        let secret = [7_u8; 32];
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let cell = "01234567-89ab-cdef-0123-456789abcdef";
+        let proof = sign(
+            &secret,
+            &execution_request_material("executeDiagnostic", cell, nonce),
+        );
+        assert!(verify(
+            &secret,
+            &execution_request_material("executeDiagnostic", cell, nonce),
+            &proof
+        ));
+        assert!(!verify(
+            &secret,
+            &execution_request_material("evictDiagnostic", cell, nonce),
+            &proof
+        ));
+        assert!(!verify(
+            &secret,
+            &execution_request_material(
+                "executeDiagnostic",
+                "fedcba98-7654-3210-fedc-ba9876543210",
+                nonce,
+            ),
+            &proof
+        ));
     }
 }
