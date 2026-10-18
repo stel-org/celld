@@ -4703,6 +4703,11 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         });
     }
 
+    // This optional Unix-domain socket is intentionally distinct from both
+    // HTTP listeners. It exposes only the paired Base readiness probe and
+    // cannot reach the internal operator endpoints.
+    let base_control = celld::base_control::start_from_environment(app.clone()).await?;
+
     celld::cli_output::Output::new(celld::cli_output::Format::Text).line(format_args!(
         "celld listening on {} (ownership={ownership_name})",
         listener.local_addr()?
@@ -4904,6 +4909,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             }
         }
     };
+    // Stop accepting Base probes as soon as graceful shutdown begins. The
+    // guard also removes the socket entry, while its durable pairing files
+    // keep the selected installation identity stable across a restart.
+    drop(base_control);
     // This deadline starts at the stop signal and covers token acquisition,
     // request drain, ownership handoff, transport flush, and local durability
     // shutdown. Progress can extend only the inner stall deadline. The

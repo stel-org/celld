@@ -379,6 +379,13 @@ isolate holds a dead heap until something allocates, so celld forces a
 collection when a measurement is above that share. A restart of the process
 is not necessary.
 
+## Local Base control probe
+
+For an independently deployed local Base installation, celld can expose a
+strictly limited authenticated Unix-domain-socket readiness probe. It is opt-in
+through `CELLD_BASE_CONTROL_DIR` and is not a public Worker or internal HTTP
+operator endpoint. See [the local Base control documentation](docs/base-control.md).
+
 ## Contributions
 
 Pull requests are disabled. Coding agents make it too easy to send a large,

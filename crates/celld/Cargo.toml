@@ -40,6 +40,7 @@ flate2.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 glob.workspace = true
+hex.workspace = true
 hkdf.workspace = true
 lol_html.workspace = true
 hmac.workspace = true
