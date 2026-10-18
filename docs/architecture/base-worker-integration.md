@@ -2,9 +2,10 @@
 
 ## Scope
 
-B3.1.1 proves one narrow cross-repository boundary: a JavaScript ES module
+B3.1.1 proved one narrow cross-repository boundary: a JavaScript ES module
 artifact produced by the `stel-org/base-worker` fork can run in celld's
-existing JavaScript host. The proof uses Base Worker revision
+existing JavaScript host. B3.1.2 turns that proof into a reusable local
+artifact-preparation boundary. The integration uses Base Worker revision
 `a18ce33715e30cd2b0d99c7e322ef11a65490e4d` and celld revision
 `153071ce97aed598687d00b72057d8829fe9c52a` as its starting point.
 
@@ -24,6 +25,31 @@ For the fixture in this repository, the generated artifact was 379 bytes with
 SHA-256 `debed3e12c1444ee00c5ec196e1cf3b489e208005a5cf1f066da40d8a95e2b43`.
 celld loaded that artifact through its normal V8 host and returned the expected
 200 JSON response from `GET https://base.test/bridge`.
+
+## Reusable preparation boundary
+
+`celld::base_worker_artifact::BaseWorkerArtifactPreparer` is the B3.1.2
+technical boundary. It accepts two explicit absolute paths:
+
+1. the chosen Base Worker fork executable; and
+2. a selected local JavaScript or TypeScript entrypoint.
+
+It invokes Base Worker's existing `deno bundle` implementation with the fixed
+local browser-ESM profile. It returns `BaseWorkerArtifact`, which contains the
+canonical entrypoint, selected executable, generated UTF-8 JavaScript,
+SHA-256, and byte length. The caller transfers `artifact.into_source()` into
+the existing `WorkerConfigOptions::src` field; no second Worker definition or
+execution path exists.
+
+The adapter does not search `PATH`, cache a previous artifact, or invoke a
+system `deno`. A failed preparation returns a `PreparationFailed` error with
+the selected entrypoint, executable, exit status, and Base Worker diagnostics.
+An unreadable, empty, or non-UTF-8 generated artifact has a distinct error.
+celld host loading errors remain separate from preparation errors.
+
+The implementation is source-agnostic: the entrypoint is an input parameter,
+not a fixture-specific condition. Tests prove independent TypeScript and
+JavaScript entrypoints with different local dependencies and different output.
 
 ## Responsibilities
 
@@ -90,6 +116,19 @@ and makes `GET https://base.test/bridge`. It requires an HTTP 200 JSON response:
 No KV, D1, R2, Queue or Workflow binding is configured. This preserves the
 B3.0.4-C Base-native product boundary.
 
+For the reusable B3.1.2 proof, use:
+
+```sh
+BASE_WORKER_REPO=/absolute/path/to/base-worker \
+  scripts/prove-base-worker-artifacts.sh
+```
+
+The script supplies the chosen fork executable to the ignored integration
+tests. They prepare and execute both `typescript-worker.ts` and
+`javascript-worker.js` through the same `BaseWorkerArtifactPreparer`, then
+verify their separate JSON responses. Set `BASE_WORKER_BIN` to an already-built
+absolute fork binary to avoid a build; the script still refuses PATH lookup.
+
 ## Negative coverage
 
 The proof script verifies that a missing fork executable fails without a
@@ -100,12 +139,13 @@ submitted through `WorkerConfig` is rejected by the existing host compiler.
 
 ## Limitations and next step
 
-The proof does not demonstrate JSR or npm resolution, Deno-specific host APIs,
-`Deno.serve`, persistent Worker configuration, Base Project source storage,
-Branch ownership of executions, multiple Workers per Base Cell, or production
-serving and deployment. A JavaScript bundle is not full Deno-runtime
-compatibility.
+The proof does not demonstrate JSR or npm resolution, remote module fetching,
+Deno-specific host APIs, `Deno.serve`, persistent Worker configuration, Base
+Project source storage, Branch ownership of executions, multiple Workers per
+Base Cell, or production serving and deployment. A JavaScript bundle is not
+full Deno-runtime compatibility.
 
-B3.1.2 should build on this evidence by defining a reusable, still
-artifact-only Base Worker build/execution integration. It should not change
-the Branch--Cell model or assume one Worker per Cell.
+B3.1.3 can build on this boundary by adding JSR resolution evidence without
+changing the artifact/execution separation. A later Base integration can own
+the persistence, authorization, and Branch/Cell semantics needed to select
+which source should be prepared and executed.

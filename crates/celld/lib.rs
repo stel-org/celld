@@ -25,6 +25,7 @@ pub mod assets;
 #[cfg(not(celld_internal_tests))]
 pub mod asyncrt;
 pub mod base_control;
+pub mod base_worker_artifact;
 // The internal test flag alone selects the simulated asyncrt, so an external
 // test harness built with the flag sees the same simulated world the
 // in-crate suites see. `test` must not be part of the gate:
