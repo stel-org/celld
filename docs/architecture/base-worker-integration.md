@@ -225,3 +225,41 @@ is not full Deno-runtime compatibility.
 A subsequent integration can reuse `JsrLocked` when it has product-owned
 source selection and lockfile lifecycle semantics. It must continue to keep
 Base Worker responsible for preparation and celld responsible for execution.
+
+## B3.2.1 Base-defined Worker invocation
+
+B3.2.1 consumes the existing artifact boundary from a separately built Base
+process. Base first selects a persisted Project-owned Worker definition,
+revalidates its registered Source, resolves the relative entrypoint, and runs
+the selected Base Worker fork with the existing local-only browser-ESM bundle
+profile. celld does not receive the Source path and does not resolve TypeScript
+or application imports. It receives only newly generated UTF-8 ESM bytes plus
+their verified SHA-256 identity through the paired local control socket.
+
+The control adapter's version-3 `executeWorker` operation has a signed metadata
+envelope and an exact-length binary artifact phase. Artifact bytes are limited
+to 512 KiB and their SHA-256 is recomputed before `WorkerConfigOptions::src`
+is populated. The operation then constructs the existing `WorkerConfig` and
+uses the existing `StatelessRuntime` request path. It returns a signed bounded
+HTTP result. It does not add an artifact store, module registry, deployment
+schema, scheduler, another V8 host, Deno `JsRuntime`, Cloudflare product
+binding, or public ingress.
+
+The reproducible real-process acceptance command lives in Base because the
+test begins with durable Base State definitions:
+
+```sh
+cd /absolute/path/to/base
+CELLD_REPO=/absolute/path/to/celld \
+BASE_WORKER_REPO=/absolute/path/to/base-worker \
+CELLD_ESBUILD=/absolute/path/to/esbuild \
+scripts/prove-worker-execution.sh
+```
+
+It starts a temporary independent `celld dev` process with its normal private
+pairing socket, creates one Base Project, Source, Branch, and two persisted
+Workers, and checks different TypeScript/JavaScript response bodies. This is a
+bounded stateless execution proof only. It does not establish persistent Worker
+lifecycle, Worker Management interfaces, public serving, recovery, package
+configuration, JSR selection in a Base Worker definition, or cardinality rules
+between Branches, Cells, and future Worker realizations.

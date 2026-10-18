@@ -12,8 +12,11 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::actor::{AppHandle, LocalRequestFailure, Routed};
-use crate::engine_api::{RequestBody, RuntimeFetch};
+use crate::engine_api::{Compat, RequestBody, RuntimeFetch, WorkerConfigOptions};
+use crate::js::WorkerConfig;
+use crate::runtime::StatelessRuntime;
 use anyhow::{bail, Context};
+use base64::Engine as _;
 use bytes::Bytes;
 use celld_logic::Route;
 use hmac::{Hmac, Mac};
@@ -38,10 +41,16 @@ const SECRET_NAME: &str = "base-control.secret";
 const PROTOCOL: &str = "base-celld";
 const PROTOCOL_VERSION: u32 = 1;
 const OBSERVATION_PROTOCOL_VERSION: u32 = 2;
+/// A separately versioned, bounded artifact invocation.  This deliberately
+/// does not alter the protocol or meaning of diagnostic operations.
+const WORKER_EXECUTION_PROTOCOL_VERSION: u32 = 3;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_WORKER_ARTIFACT_BYTES: usize = 512 * 1024;
+const MAX_WORKER_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const EXECUTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_EXECUTION_TIMEOUT: Duration = Duration::from_secs(3);
 const BUSY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
 const REPLAY_CACHE_CAPACITY: usize = 1024;
 const REPLAY_WINDOW: Duration = Duration::from_secs(60);
@@ -90,6 +99,27 @@ struct ExecutionRequest {
     proof: String,
 }
 
+/// The authenticated metadata envelope precedes exactly `artifact_bytes` raw
+/// UTF-8 JavaScript bytes on the same Unix socket. Keeping bytes outside the
+/// JSON envelope preserves the diagnostic control plane's 4 KiB message cap.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkerExecutionRequest {
+    operation: String,
+    protocol: String,
+    protocol_version: u32,
+    project_id: String,
+    worker_id: String,
+    branch_id: String,
+    cell_id: String,
+    artifact_sha256: String,
+    artifact_bytes: usize,
+    url: String,
+    method: String,
+    nonce: String,
+    proof: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProbeResponse<'a> {
@@ -122,6 +152,29 @@ struct ExecutionResponse<'a> {
     outcome: &'static str,
     status: Option<u16>,
     body: Option<&'a str>,
+    nonce: &'a str,
+    proof: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerExecutionResponse<'a> {
+    operation: &'static str,
+    protocol: &'static str,
+    protocol_version: u32,
+    installation_id: &'a str,
+    implementation: &'static str,
+    implementation_version: &'static str,
+    project_id: &'a str,
+    worker_id: &'a str,
+    branch_id: &'a str,
+    cell_id: &'a str,
+    scope: &'static str,
+    outcome: &'static str,
+    status: Option<u16>,
+    body_base64: Option<String>,
+    body_sha256: Option<String>,
+    body_bytes: Option<usize>,
     nonce: &'a str,
     proof: String,
 }
@@ -466,6 +519,14 @@ async fn handle_execution(
     replay_guard: Arc<ReplayGuard>,
     value: serde_json::Value,
 ) -> anyhow::Result<()> {
+    if value.get("operation").and_then(serde_json::Value::as_str) == Some("executeWorker") {
+        let request: WorkerExecutionRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(_) => return Ok(()),
+        };
+        return handle_worker_execution(stream, installation_id, secret, replay_guard, request)
+            .await;
+    }
     let request: ExecutionRequest = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => return Ok(()),
@@ -536,6 +597,186 @@ async fn handle_execution(
     )
     .await
     .context("Base diagnostic lifecycle operation timed out")?
+}
+
+async fn handle_worker_execution(
+    mut stream: UnixStream,
+    installation_id: &str,
+    secret: &[u8],
+    replay_guard: Arc<ReplayGuard>,
+    request: WorkerExecutionRequest,
+) -> anyhow::Result<()> {
+    let authenticated = request.operation == "executeWorker"
+        && request.protocol == PROTOCOL
+        && request.protocol_version == WORKER_EXECUTION_PROTOCOL_VERSION
+        && valid_nonce(&request.nonce)
+        && valid_cell_id(&request.project_id)
+        && valid_cell_id(&request.worker_id)
+        && valid_cell_id(&request.branch_id)
+        && valid_cell_id(&request.cell_id)
+        && valid_digest(&request.artifact_sha256)
+        && request.artifact_bytes > 0
+        && request.artifact_bytes <= MAX_WORKER_ARTIFACT_BYTES
+        && request.url.len() <= 2_048
+        && request.method == "GET"
+        && verify(
+            secret,
+            &worker_execution_request_material(&request),
+            &request.proof,
+        );
+    if !authenticated {
+        write_json(
+            &mut stream,
+            &Rejection {
+                error: "authentication_rejected",
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let replay_identity = format!(
+        "executeWorker:{}:{}:{}",
+        request.worker_id, request.artifact_sha256, request.nonce
+    );
+    if !replay_guard.record_if_new(replay_identity) {
+        write_json(
+            &mut stream,
+            &Rejection {
+                error: "replay_rejected",
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let mut artifact = vec![0_u8; request.artifact_bytes];
+    if !matches!(
+        tokio::time::timeout(WORKER_EXECUTION_TIMEOUT, stream.read_exact(&mut artifact)).await,
+        Ok(Ok(_))
+    ) {
+        return Ok(());
+    }
+    if hex::encode(Sha256::digest(&artifact)) != request.artifact_sha256 {
+        write_json(
+            &mut stream,
+            &Rejection {
+                error: "authentication_rejected",
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let source = match String::from_utf8(artifact) {
+        Ok(source) => source,
+        Err(_) => {
+            write_json(
+                &mut stream,
+                &Rejection {
+                    error: "authentication_rejected",
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    tokio::time::timeout(
+        WORKER_EXECUTION_TIMEOUT,
+        execute_worker_artifact(&mut stream, installation_id, secret, request, source),
+    )
+    .await
+    .context("Base Worker execution timed out")?
+}
+
+async fn execute_worker_artifact(
+    stream: &mut UnixStream,
+    installation_id: &str,
+    secret: &[u8],
+    request: WorkerExecutionRequest,
+    source: String,
+) -> anyhow::Result<()> {
+    let execution = async {
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source,
+            script_name: format!("base-worker-{}", request.worker_id),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "base-worker-control".to_owned(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        });
+        let runtime = StatelessRuntime::start(
+            Arc::new(config),
+            Arc::from("base-worker-control"),
+            Arc::from("base-worker-control"),
+        )?;
+        runtime
+            .fetch(
+                request.url.clone(),
+                request.method.clone(),
+                RequestBody::from(Vec::new()),
+                Vec::new(),
+                None,
+            )
+            .await
+    }
+    .await;
+    let (outcome, status, body) = match execution {
+        Ok(response)
+            if response.stream.is_none()
+                && response.websocket.is_none()
+                && response.body.len() <= MAX_WORKER_RESPONSE_BYTES =>
+        {
+            ("executed", Some(response.status), Some(response.body))
+        }
+        Ok(_) | Err(_) => ("execution_refused", None, None),
+    };
+    let body_base64 = body
+        .as_ref()
+        .map(|value| base64::engine::general_purpose::STANDARD.encode(value));
+    let body_sha256 = body
+        .as_ref()
+        .map(|value| hex::encode(Sha256::digest(value)));
+    let body_bytes = body.as_ref().map(Vec::len);
+    let proof = sign(
+        secret,
+        &worker_execution_response_material(
+            installation_id,
+            env!("CARGO_PKG_VERSION"),
+            &request,
+            outcome,
+            status,
+            body_sha256.as_deref(),
+            body_bytes,
+        ),
+    );
+    let response = WorkerExecutionResponse {
+        operation: "executeWorker",
+        protocol: PROTOCOL,
+        protocol_version: WORKER_EXECUTION_PROTOCOL_VERSION,
+        installation_id,
+        implementation: "celld",
+        implementation_version: env!("CARGO_PKG_VERSION"),
+        project_id: &request.project_id,
+        worker_id: &request.worker_id,
+        branch_id: &request.branch_id,
+        cell_id: &request.cell_id,
+        scope: "stateless",
+        outcome,
+        status,
+        body_base64,
+        body_sha256,
+        body_bytes,
+        nonce: &request.nonce,
+        proof,
+    };
+    write_json(stream, &response).await
 }
 
 async fn execute_or_evict(
@@ -761,6 +1002,10 @@ fn valid_cell_id(value: &str) -> bool {
         })
 }
 
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn request_material(nonce: &str) -> String {
     format!("request:{PROTOCOL}:{PROTOCOL_VERSION}:{nonce}")
 }
@@ -778,6 +1023,50 @@ fn response_material(
 
 fn execution_request_material(version: u32, operation: &str, cell_id: &str, nonce: &str) -> String {
     format!("execution:{PROTOCOL}:{version}:{operation}:{cell_id}:{nonce}")
+}
+
+fn worker_execution_request_material(request: &WorkerExecutionRequest) -> String {
+    format!(
+        "worker-execution:{PROTOCOL}:{WORKER_EXECUTION_PROTOCOL_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        request.operation,
+        request.project_id,
+        request.worker_id,
+        request.branch_id,
+        request.cell_id,
+        request.artifact_sha256,
+        request.artifact_bytes,
+        request.method,
+        request.url,
+        request.nonce,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signed worker response binds every selected Base context and bounded body fact"
+)]
+fn worker_execution_response_material(
+    installation_id: &str,
+    implementation_version: &str,
+    request: &WorkerExecutionRequest,
+    outcome: &str,
+    status: Option<u16>,
+    body_sha256: Option<&str>,
+    body_bytes: Option<usize>,
+) -> String {
+    format!(
+        "worker-execution-response:{PROTOCOL}:{WORKER_EXECUTION_PROTOCOL_VERSION}:executeWorker:{installation_id}:celld:{implementation_version}:stateless:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        request.project_id,
+        request.worker_id,
+        request.branch_id,
+        request.cell_id,
+        request.artifact_sha256,
+        outcome,
+        status.map_or_else(String::new, |value| value.to_string()),
+        body_sha256.unwrap_or(""),
+        body_bytes.map_or_else(String::new, |value| value.to_string()),
+        request.nonce,
+    )
 }
 
 #[allow(
@@ -897,6 +1186,44 @@ mod tests {
                 "fedcba98-7654-3210-fedc-ba9876543210",
                 nonce,
             ),
+            &proof
+        ));
+    }
+
+    #[test]
+    fn worker_execution_proof_binds_artifact_and_base_context() {
+        let secret = [7_u8; 32];
+        let request = WorkerExecutionRequest {
+            operation: "executeWorker".to_owned(),
+            protocol: PROTOCOL.to_owned(),
+            protocol_version: WORKER_EXECUTION_PROTOCOL_VERSION,
+            project_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            worker_id: "11234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            branch_id: "21234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            cell_id: "31234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            artifact_sha256: "a".repeat(64),
+            artifact_bytes: 12,
+            url: "https://base.test/worker".to_owned(),
+            method: "GET".to_owned(),
+            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            proof: String::new(),
+        };
+        let material = worker_execution_request_material(&request);
+        let proof = sign(&secret, &material);
+        assert!(verify(&secret, &material, &proof));
+
+        let mut changed = request;
+        changed.artifact_sha256 = "b".repeat(64);
+        assert!(!verify(
+            &secret,
+            &worker_execution_request_material(&changed),
+            &proof
+        ));
+        changed.artifact_sha256 = "a".repeat(64);
+        changed.worker_id = "41234567-89ab-cdef-0123-456789abcdef".to_owned();
+        assert!(!verify(
+            &secret,
+            &worker_execution_request_material(&changed),
             &proof
         ));
     }

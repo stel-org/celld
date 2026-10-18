@@ -98,3 +98,30 @@ The trust model is a same-user local operator. Unix permissions and the HMAC
 secret stop ordinary other-user access and unauthenticated responders. A process
 with equivalent Unix account and filesystem authority that can read the secret
 is already inside the pairing boundary.
+
+## B3.2.1 bounded Base Worker invocation
+
+Protocol version 3 adds one separately authenticated operation,
+`executeWorker`. It is not a general celld control plane and it does not alter
+the meaning, limits, or derived `BaseDiagnostic` scope of the version 1/2
+diagnostic operations.
+
+The client sends a JSON metadata envelope below the existing 4 KiB limit. The
+envelope names a Project, Worker, Branch, and Base Cell UUID, a bounded `GET`
+URL, artifact SHA-256 and byte count, a fresh nonce, and an HMAC proof bound to
+every one of those values. It then writes exactly the declared UTF-8 artifact
+bytes on that authenticated Unix socket. celld accepts at most 512 KiB,
+recomputes the SHA-256 before compilation, rejects malformed/replayed/invalid
+proof requests before reading or executing code, and limits execution to three
+seconds. A response is at most 64 KiB, Base64 encoded, and HMAC-bound to all
+selected identities, artifact digest, outcome, status, body digest/length, and
+nonce.
+
+celld loads a verified artifact through its existing `WorkerConfig` and
+`StatelessRuntime`; this is the established V8 host, not Deno `JsRuntime`, a
+new engine, a Node subprocess, a public listener, or a Durable Object Cell
+realization. The supplied Base Cell is correlation context only. `executeWorker`
+does not create a persistent Worker deployment, public endpoint, runtime
+placement, or lifecycle state. A timeout or lost response after acceptance is
+therefore an unknown one-off effect and the Base caller must not retry it
+automatically.
