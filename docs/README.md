@@ -312,43 +312,18 @@ and it does not watch files outside the project.
 The local object store is not available to a fleet node or an operator
 subcommand; they need a supported cloud bucket.
 
-## Operate D1, KV, and R2
+## Legacy product-management reference
 
-These commands use the fleet bucket. `celld d1` and `celld kv` reach the
-database cell through a node.
+The active CLI no longer accepts `celld d1`, `celld kv`, `celld r2`, or
+`celld queue`. The retained runtime and service documentation describe only
+temporary compatibility while Base-native cleanup is staged; fresh
+Base-native installations must not adopt these product services.
 
-```sh
-celld d1 migrations apply ledger --bucket "$CELLD_BUCKET"
-celld kv bulk put sessions wrangler-export.json --bucket "$CELLD_BUCKET"
-```
-
-The `migrations_dir` value must be a relative path inside the project,
-without a `..` component. The KV bulk commands use the Wrangler file
-format. `celld kv bulk get` streams; a named output file changes only
-after the export completes, and a failed stdout export leaves an
-incomplete JSON array.
-
-`celld r2` reads and writes the objects of an `r2_buckets` binding under
-the reserved `r2/<bucket_name>/` prefix. It needs no running node, so a
-release pipeline can publish an artifact before it deploys.
-
-```sh
-celld r2 put assets app.zip --path dist/app.zip \
-  --content-type application/zip \
-  --metadata '{"release":"1.2.3"}' \
-  --bucket "$CELLD_BUCKET"
-```
-
-The first argument is the `bucket_name`, not the binding name. `--metadata`
-becomes `customMetadata`, and the content flags become `httpMetadata`. An
-object that another tool writes into the prefix is also readable, without
-`cacheExpiry` or checksums. `celld r2 get` streams the body to stdout, and
-`celld r2 head` prints the stored record; with `--json`, the
-`http` and `custom` fields hold `httpMetadata` and `customMetadata`.
-
-`celld kv list` and `celld r2 list` print at most 1000 keys and print the
-`--after KEY` that continues the listing on stderr. Pass `--all` for every
-key and `--json` for one JSON object per key.
+Existing state is preserved without a data migration. For a legacy operator
+workflow, manually build the pinned revision
+`bf39ed6d6e6bbb8e995f7a96b48112b7ba804bde`; celld does not launch it
+automatically. The full policy and limitations are in
+[`architecture/base-native-compatibility.md`](architecture/base-native-compatibility.md).
 
 Every celld command writes data to stdout and messages to stderr. A closed
 stdout pipe is a successful stop.

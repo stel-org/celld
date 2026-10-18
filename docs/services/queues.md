@@ -1,5 +1,10 @@
 # Queues
 
+> **Legacy compatibility reference.** The active `celld queue` CLI was retired
+> in B3.0.4-A. This page documents temporarily retained runtime behavior for
+> existing deployments only; fresh Base-native installations must not adopt
+> Queues. Existing durable state is preserved without a data migration.
+
 [Queues](https://developers.cloudflare.com/queues/) is a message broker. A
 producer Worker sends a message, and a consumer Worker receives it later in a
 batch. Each queue is one celld cell. Read the

@@ -1,5 +1,10 @@
 # KV
 
+> **Legacy compatibility reference.** The active `celld kv` CLI was retired
+> in B3.0.4-A. This page documents temporarily retained runtime behavior for
+> existing deployments only; fresh Base-native installations must not adopt KV.
+> Existing durable state is preserved without a data migration.
+
 KV is a key-value store that a Worker reaches through a binding. Each namespace
 is one celld cell, and a value above 1 MiB lives in the fleet bucket. Read the
 [Cloudflare KV documentation](https://developers.cloudflare.com/kv/api/) for the

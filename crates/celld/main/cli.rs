@@ -38,10 +38,6 @@ pub(crate) enum Action {
     Deploy(Vec<String>),
     Dev(Vec<String>),
     Cell(Vec<String>),
-    D1(Vec<String>),
-    Kv(Vec<String>),
-    Queue(Vec<String>),
-    R2(Vec<String>),
     Connect(Vec<String>),
     Credentials(Vec<String>),
     Token(Vec<String>),
@@ -54,11 +50,10 @@ impl Action {
     /// Whether this invocation's stdout carries data rather than a log stream.
     ///
     /// A node's stdout *is* its log, and Docker and journald read it. A CLI
-    /// subcommand's stdout is its answer: `celld kv get KEY > value` must write
-    /// the value and nothing else, and `celld d1 execute` prints JSON a script
-    /// parses. Sharing one stream between the two prefixes an operator's data
-    /// with whatever the process happened to warn about at startup, which is
-    /// how this was found -- an allocator warning landed in front of a value.
+    /// data-producing subcommand's stdout is its answer. Sharing one stream
+    /// between the two prefixes an operator's data with whatever the process
+    /// happened to warn about at startup, which is how this was found -- an
+    /// allocator warning landed in front of a value.
     pub(crate) fn stdout_is_data(&self) -> bool {
         !matches!(
             self,
@@ -75,10 +70,6 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "deploy" => return Ok(Action::Deploy(arguments)),
             "dev" => return Ok(Action::Dev(arguments)),
             "cell" => return Ok(Action::Cell(arguments)),
-            "d1" => return Ok(Action::D1(arguments)),
-            "kv" => return Ok(Action::Kv(arguments)),
-            "queue" => return Ok(Action::Queue(arguments)),
-            "r2" => return Ok(Action::R2(arguments)),
             "connect" => return Ok(Action::Connect(arguments)),
             "credentials" => return Ok(Action::Credentials(arguments)),
             "token" => return Ok(Action::Token(arguments)),
@@ -271,11 +262,6 @@ USAGE:
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
-  celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld queue info|peek|purge|pause|resume|redrive QUEUE --bucket [s3://|gs://|az://]NAME[/PREFIX]
-  celld r2 get|head|put|delete|list BUCKET [KEY] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld diagnose --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS] [--peer NODE_ID]...
 
 Production install: celld --bucket s3://NAME [OPTIONS]
@@ -376,7 +362,7 @@ TUNING:
                                   (default: `fleet`; `bucket` always waits)
   CELLD_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
   CELLD_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
-  CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)
+  CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; 0 disables)
   CELLD_LTX_RETENTION_SECS        Grace in seconds before an owner deletes superseded epochs (default: unset, no deletion)
   RUST_LOG                        Runtime log filter (default: info)
 

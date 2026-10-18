@@ -2920,8 +2920,8 @@ async fn handle_internal(
                 ))
             }
         }
-        // The operator CLIs' way in (`celld d1`, queues, workflows): the same
-        // forwarding dispatch `/do/` uses, with the fleet authentication
+        // The retained legacy runtime adapters' way in: the same forwarding
+        // dispatch `/do/` uses, with the fleet authentication
         // `/do/` does not have. A runtime class holds application data and
         // answers an operator protocol — arbitrary SQL for D1 — so it must
         // not be reachable from an unauthenticated route; `/do/` refuses a
@@ -2934,7 +2934,8 @@ async fn handle_internal(
         // With one entrance and one refusal, a class added to
         // `RESERVED_CLASSES` inherits both. (The pre-v5 `/__d1/` alias died
         // with the v0.4.0 stop-the-world upgrade; the CLI in this tree sends
-        // `/runtime/`.)
+        // `/runtime/`.) The public product-management CLI does not expose
+        // this route.
         _ if path.starts_with("/runtime/") && app.runtime.is_some() => {
             let scope = path
                 .strip_prefix("/runtime/")
@@ -3522,10 +3523,6 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         Action::Deploy(arguments) => return fleet::run_deploy(arguments).await,
         Action::Dev(arguments) => return celld::dev::run(arguments).await,
         Action::Cell(arguments) => return celld::cell_cli::run(arguments).await,
-        Action::D1(arguments) => return celld::d1_cli::run(arguments).await,
-        Action::Kv(arguments) => return celld::kv_cli::run(arguments).await,
-        Action::Queue(arguments) => return celld::queue_cli::run(arguments).await,
-        Action::R2(arguments) => return celld::r2_cli::run(arguments).await,
         Action::Connect(arguments) => {
             return celld::control_plane::handle_connect_command(arguments).await
         }

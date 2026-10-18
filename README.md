@@ -276,44 +276,18 @@ so the command prints at most 1000 and reports on stderr that more exist.
 Pass `--after SCOPE` to continue from the last instance printed, or `--all`
 to read the whole listing.
 
-`celld d1` runs SQL and migrations against a deployed D1 database. It finds a
-node through the same node leases, and that node sends the work to the node
-that owns the database:
+## Retired product-management commands
 
-```sh
-celld d1 migrations apply ledger --bucket s3://my-cells-bucket
-```
+The active `celld` executable no longer exposes `d1`, `kv`, `r2`, or `queue`
+product-management commands. Their runtime and durable-data compatibility
+remain temporarily while the Base-native cleanup proceeds; this is not an
+invitation to use those product surfaces in a fresh Base-native installation.
 
-The migration file extension is ASCII case-insensitive, so `.sql` and `.SQL`
-files are migrations. The command ignores a file with a different extension.
-
-`celld kv` reads and writes a deployed KV namespace. Its bulk commands use the
-Wrangler file format, so a Wrangler export can migrate directly into celld:
-
-```sh
-celld kv bulk put sessions wrangler-export.json \
-  --bucket s3://my-cells-bucket
-```
-
-`celld r2` reads and writes the objects behind an `r2_buckets` binding. The
-command reads the fleet bucket directly, so it needs no running node and a
-release pipeline can publish an artifact before it deploys the Worker:
-
-```sh
-celld r2 put assets app.zip --path dist/app.zip \
-  --content-type application/zip \
-  --metadata '{"release":"1.2.3"}' \
-  --bucket s3://my-cells-bucket
-```
-
-`celld queue` inspects and controls a deployed Queue. A queue can continue to
-accept messages while delivery is paused:
-
-```sh
-celld queue info jobs --bucket s3://my-cells-bucket
-celld queue pause jobs --bucket s3://my-cells-bucket
-celld queue resume jobs --bucket s3://my-cells-bucket
-```
+Operators needing a legacy command must build the explicitly pinned historical
+revision `bf39ed6d6e6bbb8e995f7a96b48112b7ba804bde` themselves. celld never
+launches that compatibility binary automatically. See
+[`docs/architecture/base-native-compatibility.md`](docs/architecture/base-native-compatibility.md)
+for the supported boundary and preservation policy.
 
 Set a hard resident-cell limit on each loaded node:
 
