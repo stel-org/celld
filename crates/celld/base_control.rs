@@ -1,8 +1,15 @@
 //! A deliberately narrow, local integration probe for a paired Base install.
 //!
-//! This is not celld's operator HTTP surface and it does not perform any cell
-//! operation.  When enabled, it binds a Unix-domain socket in an explicitly
-//! configured private directory and answers one authenticated readiness probe.
+//! This is not celld's operator HTTP surface. When enabled, it binds a
+//! Unix-domain socket in an explicitly configured private directory and
+//! exposes only paired Base readiness, fixed diagnostic lifecycle, and
+//! non-activating presence operations.
+
+// This module is an operator-selected host-side UDS boundary: it creates and
+// protects pairing files, owns a listener, and applies request deadlines. It
+// is deliberately outside celld's injected node-storage and actor-effect
+// paths, so its host filesystem, clock, and task primitives are explicit.
+#![allow(clippy::disallowed_methods)]
 
 use crate::actor::{AppHandle, LocalRequestFailure, Routed};
 use crate::engine_api::{RequestBody, RuntimeFetch};
@@ -12,12 +19,16 @@ use celld_logic::Route;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 const CONTROL_DIRECTORY: &str = "CELLD_BASE_CONTROL_DIR";
@@ -26,8 +37,14 @@ const INSTALLATION_ID_NAME: &str = "base-installation-id";
 const SECRET_NAME: &str = "base-control.secret";
 const PROTOCOL: &str = "base-celld";
 const PROTOCOL_VERSION: u32 = 1;
+const OBSERVATION_PROTOCOL_VERSION: u32 = 2;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const EXECUTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const BUSY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(100);
+const REPLAY_CACHE_CAPACITY: usize = 1024;
+const REPLAY_WINDOW: Duration = Duration::from_secs(60);
 const DIAGNOSTIC_CLASS: &str = "BaseDiagnostic";
 const MAX_DIAGNOSTIC_RESPONSE_BYTES: usize = 1024;
 
@@ -109,6 +126,53 @@ struct ExecutionResponse<'a> {
     proof: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InspectionResponse<'a> {
+    operation: &'static str,
+    protocol: &'static str,
+    protocol_version: u32,
+    installation_id: &'a str,
+    implementation: &'static str,
+    implementation_version: &'static str,
+    process_instance_id: &'a str,
+    cell_id: &'a str,
+    scope: &'a str,
+    local_presence: &'static str,
+    epoch: Option<u64>,
+    observed_at_ms: u128,
+    nonce: &'a str,
+    proof: String,
+}
+
+#[derive(Default)]
+struct ReplayGuard {
+    entries: Mutex<VecDeque<(Instant, String)>>,
+}
+
+impl ReplayGuard {
+    fn record_if_new(&self, identity: String) -> bool {
+        let Ok(mut entries) = self.entries.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        while entries
+            .front()
+            .is_some_and(|(recorded, _)| now.duration_since(*recorded) > REPLAY_WINDOW)
+        {
+            entries.pop_front();
+        }
+        if entries.iter().any(|(_, recorded)| recorded == &identity) {
+            return false;
+        }
+        if entries.len() == REPLAY_CACHE_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((now, identity));
+        true
+    }
+}
+
 /// Starts the optional Base integration boundary selected by
 /// `CELLD_BASE_CONTROL_DIR`. A normal celld installation remains independent
 /// of Base when this variable is absent.
@@ -120,25 +184,39 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
     let control = ControlDirectory::prepare(&directory)?;
     let listener = bind_socket(&control.socket_path)?;
     let socket_path = control.socket_path.clone();
+    let process_instance_id = random_process_instance_id()?;
+    let admission = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let replay_guard = Arc::new(ReplayGuard::default());
     let task = tokio::spawn(async move {
         loop {
             let accepted = listener.accept().await;
             let Ok((stream, _)) = accepted else {
                 return;
             };
-            // The control surface intentionally services one short request at
-            // a time. It has no unbounded worker pool and a stalled peer is
-            // bounded before another local probe can be accepted.
-            let _ = tokio::time::timeout(
-                REQUEST_TIMEOUT,
-                handle_control(
+            let Ok(permit) = admission.clone().try_acquire_owned() else {
+                // This bounded write deliberately happens in the accept loop:
+                // spawning a task for every rejected peer would reintroduce an
+                // unbounded local work queue. A stalled reject is capped.
+                let _ = tokio::time::timeout(BUSY_RESPONSE_TIMEOUT, reject_busy(stream)).await;
+                continue;
+            };
+            let app = app.clone();
+            let installation_id = control.installation_id.clone();
+            let secret = control.secret.clone();
+            let process_instance_id = process_instance_id.clone();
+            let replay_guard = replay_guard.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = handle_control(
                     stream,
-                    app.clone(),
-                    &control.installation_id,
-                    &control.secret,
-                ),
-            )
-            .await;
+                    app,
+                    &installation_id,
+                    &secret,
+                    &process_instance_id,
+                    replay_guard,
+                )
+                .await;
+            });
         }
     });
     tracing::info!(
@@ -147,6 +225,20 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
         "Base local control probe is ready"
     );
     Ok(Some(BaseControlServer { socket_path, task }))
+}
+
+fn random_process_instance_id() -> anyhow::Result<String> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).context("generate Base control process identity")?;
+    let hex = hex::encode(random);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 impl ControlDirectory {
@@ -298,14 +390,27 @@ async fn handle_control(
     app: AppHandle,
     installation_id: &str,
     secret: &[u8],
+    process_instance_id: &str,
+    replay_guard: Arc<ReplayGuard>,
 ) -> anyhow::Result<()> {
-    let body = read_message(&mut stream).await?;
+    let body = tokio::time::timeout(SHORT_REQUEST_TIMEOUT, read_message(&mut stream))
+        .await
+        .context("Base control request body timed out")??;
     let value: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => return Ok(()),
     };
     if value.get("operation").is_some() {
-        return handle_execution(stream, app, installation_id, secret, value).await;
+        return handle_execution(
+            stream,
+            app,
+            installation_id,
+            secret,
+            process_instance_id,
+            replay_guard,
+            value,
+        )
+        .await;
     }
     let request: ProbeRequest = match serde_json::from_value(value) {
         Ok(request) => request,
@@ -357,22 +462,31 @@ async fn handle_execution(
     app: AppHandle,
     installation_id: &str,
     secret: &[u8],
+    process_instance_id: &str,
+    replay_guard: Arc<ReplayGuard>,
     value: serde_json::Value,
 ) -> anyhow::Result<()> {
     let request: ExecutionRequest = match serde_json::from_value(value) {
         Ok(request) => request,
         Err(_) => return Ok(()),
     };
-    if !matches!(
-        request.operation.as_str(),
-        "executeDiagnostic" | "evictDiagnostic"
-    ) || request.protocol != PROTOCOL
-        || request.protocol_version != PROTOCOL_VERSION
+    let supported = matches!(
+        (request.operation.as_str(), request.protocol_version),
+        ("executeDiagnostic" | "evictDiagnostic", PROTOCOL_VERSION)
+            | ("inspectDiagnostic", OBSERVATION_PROTOCOL_VERSION)
+    );
+    if !supported
+        || request.protocol != PROTOCOL
         || !valid_nonce(&request.nonce)
         || !valid_cell_id(&request.cell_id)
         || !verify(
             secret,
-            &execution_request_material(&request.operation, &request.cell_id, &request.nonce),
+            &execution_request_material(
+                request.protocol_version,
+                &request.operation,
+                &request.cell_id,
+                &request.nonce,
+            ),
             &request.proof,
         )
     {
@@ -387,6 +501,51 @@ async fn handle_execution(
     }
 
     let scope = format!("{DIAGNOSTIC_CLASS}:{}", request.cell_id);
+    if request.operation == "inspectDiagnostic" {
+        return tokio::time::timeout(
+            SHORT_REQUEST_TIMEOUT,
+            inspect_diagnostic(
+                stream,
+                app,
+                installation_id,
+                secret,
+                process_instance_id,
+                request,
+                scope,
+            ),
+        )
+        .await
+        .context("Base diagnostic inspection timed out")?;
+    }
+    if !replay_guard.record_if_new(format!(
+        "{}:{}:{}",
+        request.operation, request.cell_id, request.nonce
+    )) {
+        write_json(
+            &mut stream,
+            &Rejection {
+                error: "replay_rejected",
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    tokio::time::timeout(
+        EXECUTION_REQUEST_TIMEOUT,
+        execute_or_evict(stream, app, installation_id, secret, request, scope),
+    )
+    .await
+    .context("Base diagnostic lifecycle operation timed out")?
+}
+
+async fn execute_or_evict(
+    mut stream: UnixStream,
+    app: AppHandle,
+    installation_id: &str,
+    secret: &[u8],
+    request: ExecutionRequest,
+    scope: String,
+) -> anyhow::Result<()> {
     let (outcome, status, body) = match request.operation.as_str() {
         "executeDiagnostic" => match execute_diagnostic(&app, scope.clone()).await {
             Ok((status, body)) => ("executed", Some(status), Some(body)),
@@ -438,6 +597,72 @@ async fn handle_execution(
         ),
     };
     write_json(&mut stream, &response).await
+}
+
+async fn inspect_diagnostic(
+    mut stream: UnixStream,
+    app: AppHandle,
+    installation_id: &str,
+    secret: &[u8],
+    process_instance_id: &str,
+    request: ExecutionRequest,
+    scope: String,
+) -> anyhow::Result<()> {
+    let presence = app.presence().await.context("celld actor is unavailable")?;
+    let epoch = presence
+        .cells
+        .iter()
+        .find(|cell| cell.id == scope)
+        .map(|cell| cell.epoch);
+    let local_presence = if epoch.is_some() {
+        "locally_present"
+    } else {
+        "locally_absent"
+    };
+    let observed_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time precedes Unix epoch")?
+        .as_millis();
+    let response = InspectionResponse {
+        operation: "inspectDiagnostic",
+        protocol: PROTOCOL,
+        protocol_version: OBSERVATION_PROTOCOL_VERSION,
+        installation_id,
+        implementation: "celld",
+        implementation_version: env!("CARGO_PKG_VERSION"),
+        process_instance_id,
+        cell_id: &request.cell_id,
+        scope: &scope,
+        local_presence,
+        epoch,
+        observed_at_ms,
+        nonce: &request.nonce,
+        proof: sign(
+            secret,
+            &inspection_response_material(
+                installation_id,
+                env!("CARGO_PKG_VERSION"),
+                process_instance_id,
+                &request.cell_id,
+                &scope,
+                local_presence,
+                epoch,
+                observed_at_ms,
+                &request.nonce,
+            ),
+        ),
+    };
+    write_json(&mut stream, &response).await
+}
+
+async fn reject_busy(mut stream: UnixStream) -> anyhow::Result<()> {
+    write_json(
+        &mut stream,
+        &Rejection {
+            error: "capacity_exhausted",
+        },
+    )
+    .await
 }
 
 async fn execute_diagnostic(app: &AppHandle, scope: String) -> anyhow::Result<(u16, String)> {
@@ -551,8 +776,29 @@ fn response_material(
     )
 }
 
-fn execution_request_material(operation: &str, cell_id: &str, nonce: &str) -> String {
-    format!("execution:{PROTOCOL}:{PROTOCOL_VERSION}:{operation}:{cell_id}:{nonce}")
+fn execution_request_material(version: u32, operation: &str, cell_id: &str, nonce: &str) -> String {
+    format!("execution:{PROTOCOL}:{version}:{operation}:{cell_id}:{nonce}")
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signed observation wire contract names every authenticated field"
+)]
+fn inspection_response_material(
+    installation_id: &str,
+    implementation_version: &str,
+    process_instance_id: &str,
+    cell_id: &str,
+    scope: &str,
+    local_presence: &str,
+    epoch: Option<u64>,
+    observed_at_ms: u128,
+    nonce: &str,
+) -> String {
+    format!(
+        "inspection-response:{PROTOCOL}:{OBSERVATION_PROTOCOL_VERSION}:{installation_id}:celld:{implementation_version}:{process_instance_id}:{cell_id}:{scope}:{local_presence}:{}:{observed_at_ms}:{nonce}",
+        epoch.map_or_else(String::new, |value| value.to_string()),
+    )
 }
 
 #[allow(
@@ -631,26 +877,71 @@ mod tests {
         let cell = "01234567-89ab-cdef-0123-456789abcdef";
         let proof = sign(
             &secret,
-            &execution_request_material("executeDiagnostic", cell, nonce),
+            &execution_request_material(PROTOCOL_VERSION, "executeDiagnostic", cell, nonce),
         );
         assert!(verify(
             &secret,
-            &execution_request_material("executeDiagnostic", cell, nonce),
+            &execution_request_material(PROTOCOL_VERSION, "executeDiagnostic", cell, nonce),
             &proof
         ));
         assert!(!verify(
             &secret,
-            &execution_request_material("evictDiagnostic", cell, nonce),
+            &execution_request_material(PROTOCOL_VERSION, "evictDiagnostic", cell, nonce),
             &proof
         ));
         assert!(!verify(
             &secret,
             &execution_request_material(
+                PROTOCOL_VERSION,
                 "executeDiagnostic",
                 "fedcba98-7654-3210-fedc-ba9876543210",
                 nonce,
             ),
             &proof
+        ));
+    }
+
+    #[test]
+    fn replay_guard_rejects_an_identical_recent_mutation_only() {
+        let guard = ReplayGuard::default();
+        assert!(guard.record_if_new("executeDiagnostic:cell:nonce-a".to_owned()));
+        assert!(!guard.record_if_new("executeDiagnostic:cell:nonce-a".to_owned()));
+        assert!(guard.record_if_new("executeDiagnostic:cell:nonce-b".to_owned()));
+        assert!(guard.record_if_new("evictDiagnostic:cell:nonce-a".to_owned()));
+    }
+
+    #[test]
+    fn inspection_proof_binds_presence_epoch_and_process_instance() {
+        let secret = [7_u8; 32];
+        let installation = "01234567-89ab-cdef-0123-456789abcdef";
+        let process = "fedcba98-7654-3210-fedc-ba9876543210";
+        let material = inspection_response_material(
+            installation,
+            "0.6.2",
+            process,
+            installation,
+            "BaseDiagnostic:01234567-89ab-cdef-0123-456789abcdef",
+            "locally_present",
+            Some(3),
+            1_700_000_000_000,
+            "0123456789abcdef0123456789abcdef",
+        );
+        let proof = sign(&secret, &material);
+        assert!(verify(&secret, &material, &proof));
+        assert!(!verify(
+            &secret,
+            &inspection_response_material(
+                installation,
+                "0.6.2",
+                process,
+                installation,
+                "BaseDiagnostic:01234567-89ab-cdef-0123-456789abcdef",
+                "locally_absent",
+                None,
+                1_700_000_000_000,
+                "0123456789abcdef0123456789abcdef",
+            ),
+            &proof,
         ));
     }
 }

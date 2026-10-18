@@ -60,10 +60,39 @@ actor eviction and never exposes lease, fencing, storage, or peer operations.
 integration validation. It is not a deployment model or a user-programmable
 Worker interface.
 
+## B2.4 inspection and lifecycle hardening
+
+Version 1 remains unchanged for readiness and the fixed B2.3 lifecycle pair.
+Version 2 adds only `inspectDiagnostic`. Its signed request contains a valid
+Base Cell UUID, fresh nonce, and proof over:
+
+```text
+execution:base-celld:2:inspectDiagnostic:<cell-id>:<nonce>
+```
+
+celld derives `BaseDiagnostic:<cell-id>` and reads `AppHandle::presence()`;
+it does not route a request through `CellHost`, V8, or the diagnostic handler.
+The signed response reports a new per-control-server process-instance ID, a
+wall-clock observation timestamp, and either `locally_present` with the
+published local epoch or `locally_absent`. Presence is the actor core's local,
+published projection. Absence does not prove global absence, permanent stop,
+deletion, or a safe storage-cleanup precondition.
+
 The endpoint accepts no Worker deployment, source-path, storage, actor, peer,
 or generic operator operation. It is a Unix socket only: it is not served
 through the public Worker ingress or celld's internal HTTP listener. Requests
-are limited to 4 KiB, handled one at a time, and bounded to one second.
+are limited to 4 KiB. The server admits at most eight connections; short body
+and inspection work is bounded to one second, while the fixed execution and
+eviction operations have a five-second bound. Admission overflow receives a
+bounded `capacity_exhausted` rejection.
+
+For the lifetime of one celld process, the control adapter retains a bounded
+60-second cache of accepted mutation `(operation, cell-id, nonce)` values and
+rejects a duplicate as `replay_rejected`. This prevents an ordinary replay of
+the same captured message but is not a durable exactly-once guarantee across
+process restart. A client must treat a lost or timed-out lifecycle response as
+potentially applied and inspect current infrastructure facts rather than retry
+automatically.
 
 The trust model is a same-user local operator. Unix permissions and the HMAC
 secret stop ordinary other-user access and unauthenticated responders. A process
