@@ -15,6 +15,10 @@ use crate::actor::{AppHandle, LocalRequestFailure, Routed};
 use crate::engine_api::{Compat, RequestBody, RuntimeFetch, WorkerConfigOptions};
 use crate::js::WorkerConfig;
 use crate::runtime::StatelessRuntime;
+use crate::worker_realization::{
+    bounded_response, InvokeError, LocalPresence, RealizationMetadata, RetireResult,
+    WorkerRealizationRegistry,
+};
 use anyhow::{bail, Context};
 use base64::Engine as _;
 use bytes::Bytes;
@@ -44,6 +48,9 @@ const OBSERVATION_PROTOCOL_VERSION: u32 = 2;
 /// A separately versioned, bounded artifact invocation.  This deliberately
 /// does not alter the protocol or meaning of diagnostic operations.
 const WORKER_EXECUTION_PROTOCOL_VERSION: u32 = 3;
+/// Managed Worker realizations deliberately use a new contract: v3 remains
+/// the pre-existing, one-off stateless execution operation.
+const WORKER_REALIZATION_PROTOCOL_VERSION: u32 = 4;
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_WORKER_ARTIFACT_BYTES: usize = 512 * 1024;
 const MAX_WORKER_RESPONSE_BYTES: usize = 64 * 1024;
@@ -120,6 +127,25 @@ struct WorkerExecutionRequest {
     proof: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkerRealizationRequest {
+    operation: String,
+    protocol: String,
+    protocol_version: u32,
+    realization_id: String,
+    project_id: String,
+    worker_id: String,
+    branch_id: String,
+    cell_id: String,
+    artifact_sha256: String,
+    artifact_bytes: Option<usize>,
+    url: Option<String>,
+    method: Option<String>,
+    nonce: String,
+    proof: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProbeResponse<'a> {
@@ -171,6 +197,31 @@ struct WorkerExecutionResponse<'a> {
     cell_id: &'a str,
     scope: &'static str,
     outcome: &'static str,
+    status: Option<u16>,
+    body_base64: Option<String>,
+    body_sha256: Option<String>,
+    body_bytes: Option<usize>,
+    nonce: &'a str,
+    proof: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerRealizationResponse<'a> {
+    operation: &'a str,
+    protocol: &'static str,
+    protocol_version: u32,
+    installation_id: &'a str,
+    implementation: &'static str,
+    implementation_version: &'static str,
+    process_instance_id: &'a str,
+    realization_id: &'a str,
+    project_id: &'a str,
+    worker_id: &'a str,
+    branch_id: &'a str,
+    cell_id: &'a str,
+    artifact_sha256: &'a str,
+    local_presence: &'a str,
     status: Option<u16>,
     body_base64: Option<String>,
     body_sha256: Option<String>,
@@ -240,6 +291,7 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
     let process_instance_id = random_process_instance_id()?;
     let admission = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let replay_guard = Arc::new(ReplayGuard::default());
+    let realizations = Arc::new(WorkerRealizationRegistry::default());
     let task = tokio::spawn(async move {
         loop {
             let accepted = listener.accept().await;
@@ -258,6 +310,7 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
             let secret = control.secret.clone();
             let process_instance_id = process_instance_id.clone();
             let replay_guard = replay_guard.clone();
+            let realizations = realizations.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let _ = handle_control(
@@ -267,6 +320,7 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
                     &secret,
                     &process_instance_id,
                     replay_guard,
+                    realizations,
                 )
                 .await;
             });
@@ -445,6 +499,7 @@ async fn handle_control(
     secret: &[u8],
     process_instance_id: &str,
     replay_guard: Arc<ReplayGuard>,
+    realizations: Arc<WorkerRealizationRegistry>,
 ) -> anyhow::Result<()> {
     let body = tokio::time::timeout(SHORT_REQUEST_TIMEOUT, read_message(&mut stream))
         .await
@@ -461,6 +516,7 @@ async fn handle_control(
             secret,
             process_instance_id,
             replay_guard,
+            realizations,
             value,
         )
         .await;
@@ -510,6 +566,10 @@ async fn handle_control(
     write_json(&mut stream, &response).await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the UDS adapter explicitly receives each transport trust-boundary dependency"
+)]
 async fn handle_execution(
     mut stream: UnixStream,
     app: AppHandle,
@@ -517,6 +577,7 @@ async fn handle_execution(
     secret: &[u8],
     process_instance_id: &str,
     replay_guard: Arc<ReplayGuard>,
+    realizations: Arc<WorkerRealizationRegistry>,
     value: serde_json::Value,
 ) -> anyhow::Result<()> {
     if value.get("operation").and_then(serde_json::Value::as_str) == Some("executeWorker") {
@@ -526,6 +587,30 @@ async fn handle_execution(
         };
         return handle_worker_execution(stream, installation_id, secret, replay_guard, request)
             .await;
+    }
+    if matches!(
+        value.get("operation").and_then(serde_json::Value::as_str),
+        Some(
+            "establishWorkerRealization"
+                | "invokeWorkerRealization"
+                | "inspectWorkerRealization"
+                | "retireWorkerRealization"
+        )
+    ) {
+        let request: WorkerRealizationRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(_) => return Ok(()),
+        };
+        return handle_worker_realization(
+            stream,
+            installation_id,
+            secret,
+            process_instance_id,
+            replay_guard,
+            realizations,
+            request,
+        )
+        .await;
     }
     let request: ExecutionRequest = match serde_json::from_value(value) {
         Ok(request) => request,
@@ -777,6 +862,264 @@ async fn execute_worker_artifact(
         proof,
     };
     write_json(stream, &response).await
+}
+
+async fn handle_worker_realization(
+    mut stream: UnixStream,
+    installation_id: &str,
+    secret: &[u8],
+    process_instance_id: &str,
+    replay_guard: Arc<ReplayGuard>,
+    realizations: Arc<WorkerRealizationRegistry>,
+    request: WorkerRealizationRequest,
+) -> anyhow::Result<()> {
+    let supported = matches!(
+        request.operation.as_str(),
+        "establishWorkerRealization"
+            | "invokeWorkerRealization"
+            | "inspectWorkerRealization"
+            | "retireWorkerRealization"
+    );
+    let identities_valid = [
+        &request.realization_id,
+        &request.project_id,
+        &request.worker_id,
+        &request.branch_id,
+        &request.cell_id,
+    ]
+    .iter()
+    .all(|value| valid_cell_id(value));
+    let artifact_shape = match request.operation.as_str() {
+        "establishWorkerRealization" => request
+            .artifact_bytes
+            .is_some_and(|bytes| bytes > 0 && bytes <= MAX_WORKER_ARTIFACT_BYTES),
+        "invokeWorkerRealization" => {
+            request.artifact_bytes.is_none()
+                && request.url.as_ref().is_some_and(|url| {
+                    url.len() <= 2_048
+                        && (url.starts_with("http://") || url.starts_with("https://"))
+                })
+                && request.method.as_deref() == Some("GET")
+        }
+        "inspectWorkerRealization" | "retireWorkerRealization" => {
+            request.artifact_bytes.is_none() && request.url.is_none() && request.method.is_none()
+        }
+        _ => false,
+    };
+    if !supported
+        || request.protocol != PROTOCOL
+        || request.protocol_version != WORKER_REALIZATION_PROTOCOL_VERSION
+        || !identities_valid
+        || !valid_digest(&request.artifact_sha256)
+        || !artifact_shape
+        || !valid_nonce(&request.nonce)
+        || !verify(
+            secret,
+            &worker_realization_request_material(&request),
+            &request.proof,
+        )
+    {
+        return write_json(
+            &mut stream,
+            &Rejection {
+                error: "authentication_rejected",
+            },
+        )
+        .await;
+    }
+    if request.operation != "inspectWorkerRealization"
+        && !replay_guard.record_if_new(format!(
+            "{}:{}:{}",
+            request.operation, request.realization_id, request.nonce
+        ))
+    {
+        return write_json(
+            &mut stream,
+            &Rejection {
+                error: "replay_rejected",
+            },
+        )
+        .await;
+    }
+    let metadata = RealizationMetadata {
+        realization_id: request.realization_id.clone(),
+        project_id: request.project_id.clone(),
+        worker_id: request.worker_id.clone(),
+        branch_id: request.branch_id.clone(),
+        cell_id: request.cell_id.clone(),
+        artifact_sha256: request.artifact_sha256.clone(),
+    };
+    let outcome = match request.operation.as_str() {
+        "establishWorkerRealization" => {
+            let bytes = request.artifact_bytes.expect("validated artifact bytes");
+            let mut artifact = vec![0_u8; bytes];
+            if !matches!(
+                tokio::time::timeout(WORKER_EXECUTION_TIMEOUT, stream.read_exact(&mut artifact))
+                    .await,
+                Ok(Ok(_))
+            ) || hex::encode(Sha256::digest(&artifact)) != request.artifact_sha256
+            {
+                return write_json(
+                    &mut stream,
+                    &Rejection {
+                        error: "authentication_rejected",
+                    },
+                )
+                .await;
+            }
+            let source = match String::from_utf8(artifact) {
+                Ok(source) => source,
+                Err(_) => {
+                    return write_json(
+                        &mut stream,
+                        &Rejection {
+                            error: "authentication_rejected",
+                        },
+                    )
+                    .await
+                }
+            };
+            let config = WorkerConfig::new(WorkerConfigOptions {
+                src: source,
+                script_name: format!("base-worker-realization-{}", request.realization_id),
+                do_classes: Vec::new(),
+                bindings: Vec::new(),
+                r2_bindings: Vec::new(),
+                d1_bindings: Vec::new(),
+                kv_bindings: Vec::new(),
+                queue_bindings: Vec::new(),
+                queue_consumers: Vec::new(),
+                workflow_bindings: Vec::new(),
+                vars: Vec::new(),
+                node: "base-worker-control".to_owned(),
+                modules: Vec::new(),
+                compat: Compat::default(),
+            });
+            match StatelessRuntime::start(
+                Arc::new(config),
+                Arc::from("base-worker-control"),
+                Arc::from("base-worker-control"),
+            )
+            .and_then(|runtime| {
+                realizations
+                    .establish(metadata.clone(), runtime)
+                    .map_err(Into::into)
+            }) {
+                Ok(()) => ("accepting", None, None),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Base Worker realization establishment refused");
+                    ("refused", None, None)
+                }
+            }
+        }
+        "invokeWorkerRealization" => match realizations
+            .invoke(
+                &metadata,
+                request.url.clone().expect("validated URL"),
+                request.method.clone().expect("validated method"),
+            )
+            .await
+            .and_then(|response| {
+                bounded_response(response, MAX_WORKER_RESPONSE_BYTES).map_err(InvokeError::Runtime)
+            }) {
+            Ok(response) => ("accepting", Some(response.status), Some(response.body)),
+            Err(InvokeError::Absent) => ("absent", None, None),
+            Err(InvokeError::Retiring) => ("retiring", None, None),
+            Err(InvokeError::Runtime(error)) => {
+                tracing::warn!(%error, "Base Worker realization invocation refused");
+                ("refused", None, None)
+            }
+        },
+        "inspectWorkerRealization" => match realizations.inspect(&request.realization_id) {
+            Some((actual, LocalPresence::Accepting)) if actual == metadata => {
+                ("accepting", None, None)
+            }
+            Some((actual, LocalPresence::Retiring)) if actual == metadata => {
+                ("retiring", None, None)
+            }
+            _ => ("absent", None, None),
+        },
+        "retireWorkerRealization" => match realizations.retire(&metadata).await {
+            RetireResult::Retired => ("retired", None, None),
+            RetireResult::Retiring => ("retiring", None, None),
+            RetireResult::Absent => ("absent", None, None),
+        },
+        _ => unreachable!("validated operation"),
+    };
+    write_worker_realization_response(
+        &mut stream,
+        installation_id,
+        secret,
+        process_instance_id,
+        &request,
+        outcome.0,
+        outcome.1,
+        outcome.2,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signed response explicitly names all independently authenticated fields"
+)]
+async fn write_worker_realization_response(
+    stream: &mut UnixStream,
+    installation_id: &str,
+    secret: &[u8],
+    process_instance_id: &str,
+    request: &WorkerRealizationRequest,
+    local_presence: &str,
+    status: Option<u16>,
+    body: Option<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let body_base64 = body
+        .as_ref()
+        .map(|value| base64::engine::general_purpose::STANDARD.encode(value));
+    let body_sha256 = body
+        .as_ref()
+        .map(|value| hex::encode(Sha256::digest(value)));
+    let body_bytes = body.as_ref().map(Vec::len);
+    let response = WorkerRealizationResponse {
+        operation: &request.operation,
+        protocol: PROTOCOL,
+        protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION,
+        installation_id,
+        implementation: "celld",
+        implementation_version: env!("CARGO_PKG_VERSION"),
+        process_instance_id,
+        realization_id: &request.realization_id,
+        project_id: &request.project_id,
+        worker_id: &request.worker_id,
+        branch_id: &request.branch_id,
+        cell_id: &request.cell_id,
+        artifact_sha256: &request.artifact_sha256,
+        local_presence,
+        status,
+        body_base64,
+        body_sha256,
+        body_bytes,
+        nonce: &request.nonce,
+        proof: sign(
+            secret,
+            &worker_realization_response_material(
+                installation_id,
+                env!("CARGO_PKG_VERSION"),
+                process_instance_id,
+                request,
+                local_presence,
+                status,
+                response_body_sha256(&body),
+                body.as_ref().map(Vec::len),
+            ),
+        ),
+    };
+    write_json(stream, &response).await
+}
+
+fn response_body_sha256(body: &Option<Vec<u8>>) -> Option<String> {
+    body.as_ref()
+        .map(|value| hex::encode(Sha256::digest(value)))
 }
 
 async fn execute_or_evict(
@@ -1064,6 +1407,55 @@ fn worker_execution_response_material(
         outcome,
         status.map_or_else(String::new, |value| value.to_string()),
         body_sha256.unwrap_or(""),
+        body_bytes.map_or_else(String::new, |value| value.to_string()),
+        request.nonce,
+    )
+}
+
+fn worker_realization_request_material(request: &WorkerRealizationRequest) -> String {
+    format!(
+        "worker-realization:{PROTOCOL}:{WORKER_REALIZATION_PROTOCOL_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        request.operation,
+        request.realization_id,
+        request.project_id,
+        request.worker_id,
+        request.branch_id,
+        request.cell_id,
+        request.artifact_sha256,
+        request.artifact_bytes.map_or_else(String::new, |value| value.to_string()),
+        request.method.as_deref().unwrap_or(""),
+        request.url.as_deref().unwrap_or(""),
+        request.nonce,
+        "",
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the signed realization response binds each selected identity and response fact"
+)]
+fn worker_realization_response_material(
+    installation_id: &str,
+    implementation_version: &str,
+    process_instance_id: &str,
+    request: &WorkerRealizationRequest,
+    local_presence: &str,
+    status: Option<u16>,
+    body_sha256: Option<String>,
+    body_bytes: Option<usize>,
+) -> String {
+    format!(
+        "worker-realization-response:{PROTOCOL}:{WORKER_REALIZATION_PROTOCOL_VERSION}:{}:{installation_id}:celld:{implementation_version}:{process_instance_id}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        request.operation,
+        request.realization_id,
+        request.project_id,
+        request.worker_id,
+        request.branch_id,
+        request.cell_id,
+        request.artifact_sha256,
+        local_presence,
+        status.map_or_else(String::new, |value| value.to_string()),
+        body_sha256.unwrap_or_default(),
         body_bytes.map_or_else(String::new, |value| value.to_string()),
         request.nonce,
     )

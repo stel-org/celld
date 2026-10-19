@@ -100,6 +100,7 @@ pub mod telemetry;
 pub mod wake;
 pub mod wake_entry;
 pub mod wake_format;
+pub mod worker_realization;
 pub mod ws_client;
 pub mod ws_registry;
 

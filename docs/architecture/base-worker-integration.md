@@ -263,3 +263,16 @@ bounded stateless execution proof only. It does not establish persistent Worker
 lifecycle, Worker Management interfaces, public serving, recovery, package
 configuration, JSR selection in a Base Worker definition, or cardinality rules
 between Branches, Cells, and future Worker realizations.
+
+## B3.2.3 retained artifact execution
+
+B3.2.3 consumes the same Base Worker artifact boundary without changing it.
+Base prepares an ESM artifact externally, then the paired local Base-control
+protocol can establish a bounded retained `StatelessRuntime` from that exact
+artifact. Later invocations select the realization identity and do not resend,
+rebuild, or replace the artifact. The normal celld host, V8 initialization,
+isolate pool, and HTTP dispatch remain unchanged.
+
+This only provides a local retained execution capability. It does not add
+Base-source ownership to celld, Deno host APIs, package policy, public serving,
+deployment records, automatic recovery, replicas, or a scheduler.

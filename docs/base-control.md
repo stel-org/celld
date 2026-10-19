@@ -94,6 +94,40 @@ process restart. A client must treat a lost or timed-out lifecycle response as
 potentially applied and inspect current infrastructure facts rather than retry
 automatically.
 
+## B3.2.3 managed Worker realization
+
+Protocol version 4 is a separately authenticated, local-only extension for
+Base's internal lifecycle foundation. It adds exactly four operations:
+`establishWorkerRealization`, `invokeWorkerRealization`,
+`inspectWorkerRealization`, and `retireWorkerRealization`. Version 3 keeps its
+original one-off `executeWorker` meaning.
+
+The control adapter authenticates and delegates v4 operations to the
+process-local `WorkerRealizationRegistry`. That registry is the single owner
+of retained `StatelessRuntime` values, their selected artifact configuration,
+request admission, and retirement. It is bounded to 16 retained realizations
+per celld process. It reuses the established worker isolate-pool lifecycle; a
+realization is not a promise that one V8 isolate remains permanently resident.
+
+An establish envelope precedes the bounded verified artifact bytes as in v3.
+The artifact digest is recomputed before `WorkerConfig` loading. The registry
+assigns no Base identity: Base supplies a fresh realization UUID and all
+Project, Worker, Branch, Cell, artifact, operation, request arguments and
+nonce facts are HMAC-bound. The response additionally binds the current
+process-instance identity.
+
+Invocation sends no Source or artifact bytes and dispatches through the exact
+retained runtime. Inspection is non-activating: it does not compile, warm, or
+recreate an absent runtime. Retirement first removes new-request admission,
+waits at most three seconds for already admitted requests to drain, and then
+releases the retained runtime. A drain timeout reports `retiring`; it does not
+claim that all application effects were cancelled.
+
+The registry is process-local. celld shutdown drops it, while the paired
+installation ID and secret remain stable. After restart a new process-instance
+ID and a fresh inspection reveal local absence. This is not a public
+deployment, hosting, Worker upload, generic operator, or lifecycle API.
+
 The trust model is a same-user local operator. Unix permissions and the HMAC
 secret stop ordinary other-user access and unauthenticated responders. A process
 with equivalent Unix account and filesystem authority that can read the secret
