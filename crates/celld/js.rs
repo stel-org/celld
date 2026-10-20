@@ -10089,6 +10089,7 @@ fn webcrypto_return_bytes(
     rv.set(view.into());
 }
 
+mod base_worker_profile;
 mod container;
 mod crypto;
 mod html_rewriter;
@@ -12812,6 +12813,7 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
 mod runtime_profile_feasibility_tests {
     use super::*;
     use crate::engine_api::{Compat, WorkerConfigOptions};
+    use crate::runtime::StatelessRuntime;
     use std::sync::{Arc, Once};
 
     fn init_v8() {
@@ -12896,6 +12898,101 @@ mod runtime_profile_feasibility_tests {
                 .to_string()
                 .contains("Base Worker profile probe initialization refused"),
             "unexpected profile initialization error: {error:#}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_worker_memory_usage_executes_in_the_selected_profile_only() {
+        init_v8();
+        crate::asyncrt::set_host_handle(tokio::runtime::Handle::current());
+
+        let source = r#"
+            export default {
+              fetch() {
+                for (const capability of ["env", "readTextFile", "Command", "run", "serve"]) {
+                  if (capability in Deno) {
+                    throw new Error(`unsupported Deno capability leaked: ${capability}`);
+                  }
+                }
+                const first = Deno.memoryUsage();
+                const second = Deno.memoryUsage();
+                for (const field of ["rss", "heapTotal", "heapUsed", "external"]) {
+                  if (!Number.isSafeInteger(first[field]) || first[field] < 0) {
+                    throw new Error(`invalid Deno.memoryUsage ${field}`);
+                  }
+                }
+                if (first.heapTotal < first.heapUsed) {
+                  throw new Error("Deno.memoryUsage heap statistics are inconsistent");
+                }
+                first.heapUsed = -1;
+                if (second.heapUsed < 0) {
+                  throw new Error("Deno.memoryUsage returned shared mutable state");
+                }
+                let constructorRejected = false;
+                try {
+                  new Deno.memoryUsage();
+                } catch (error) {
+                  constructorRejected = error instanceof TypeError;
+                }
+                if (!constructorRejected) {
+                  throw new Error("Deno.memoryUsage must retain Deno's non-constructor behavior");
+                }
+                return Response.json(second);
+              },
+            };
+            "#;
+        let profile_runtime = StatelessRuntime::start(
+            config(source, WorkerRuntimeProfile::BaseWorker),
+            Arc::from("base-worker-profile-node"),
+            Arc::from("base-worker-profile-region"),
+        )
+        .expect("the selected BaseWorker profile loads through celld's real host");
+        let default_runtime = StatelessRuntime::start(
+            config(source, WorkerRuntimeProfile::Default),
+            Arc::from("default-profile-node"),
+            Arc::from("default-profile-region"),
+        )
+        .expect("a default Worker can load without inheriting BaseWorker globals");
+
+        let profile_request = profile_runtime.fetch(
+            "https://base.test/memory".to_owned(),
+            "GET".to_owned(),
+            RequestBody::from(Vec::new()),
+            Vec::new(),
+            None,
+        );
+        let default_request = default_runtime.fetch(
+            "https://base.test/memory".to_owned(),
+            "GET".to_owned(),
+            RequestBody::from(Vec::new()),
+            Vec::new(),
+            None,
+        );
+        let (profile_response, default_response) = tokio::join!(profile_request, default_request);
+
+        let profile_response = profile_response
+            .expect("a Worker invokes the real BaseWorker Deno.memoryUsage API during fetch");
+        assert_eq!(profile_response.status, 200);
+        let usage: serde_json::Value = serde_json::from_slice(&profile_response.body)
+            .expect("Deno.memoryUsage response is JSON");
+        for field in ["rss", "heapTotal", "heapUsed", "external"] {
+            assert!(
+                usage[field].as_u64().is_some(),
+                "Deno.memoryUsage response has a non-negative integer {field}: {usage}"
+            );
+        }
+        assert!(
+            usage["heapTotal"].as_u64() >= usage["heapUsed"].as_u64(),
+            "Deno.memoryUsage heap statistics are consistent: {usage}"
+        );
+
+        let error = match default_response {
+            Ok(_) => panic!("Default Workers cannot invoke the BaseWorker-only Deno API"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("Deno"),
+            "default profile reports the missing BaseWorker API: {error:#}"
         );
     }
 }

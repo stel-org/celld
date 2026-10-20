@@ -376,16 +376,16 @@ pub(super) fn install_harness<'s>(
 /// deliberately do not own V8 setup, operations, module loading, Cell state,
 /// or event lifecycle; those remain the common host.
 ///
-/// Existing constructors select `Default`.  `BaseWorker` is production
-/// compiled so B3.5.2 can add reviewed APIs and adapters here, but B3.5.1
-/// intentionally exposes no Base Worker JavaScript product API.
+/// Existing constructors select `Default`. `BaseWorker` delegates to its
+/// separate reviewed profile module; B3.5.2 currently installs only the
+/// documented `Deno.memoryUsage()` slice and its lexical V8 adapter.
 pub(super) fn install_runtime_profile(
     scope: &mut v8::PinScope,
     profile: WorkerRuntimeProfile,
 ) -> Result<()> {
     match profile {
         WorkerRuntimeProfile::Default => Ok(()),
-        WorkerRuntimeProfile::BaseWorker => install_base_worker_profile(scope),
+        WorkerRuntimeProfile::BaseWorker => base_worker_profile::install(scope),
         #[cfg(test)]
         WorkerRuntimeProfile::BaseWorkerProbeFailure => {
             Err(anyhow!("Base Worker profile probe initialization refused"))
@@ -393,22 +393,7 @@ pub(super) fn install_runtime_profile(
     }
 }
 
-fn install_base_worker_profile(scope: &mut v8::PinScope) -> Result<()> {
-    // A real internal-script evaluation marks the production bootstrap seam
-    // without making a global/API promise before B3.5.2 supplies one.
-    let source = v8::String::new(scope, "void 0;")
-        .ok_or_else(|| anyhow!("create Base Worker profile bootstrap source"))?;
-    let arguments = InternalArguments {
-        names: Vec::new(),
-        values: Vec::new(),
-    };
-    run_internal_script(scope, None, source, &arguments)?;
-    #[cfg(test)]
-    install_base_worker_profile_probe(scope)?;
-    Ok(())
-}
-
-// The probe remains test-only.  It models the smallest profile-owned native
+// The probe remains test-only. It models the smallest profile-owned native
 // operation using Base Worker's Deno `op_bootstrap_pid` semantics without
 // linking deno_core or exposing a shipping global.
 #[cfg(test)]
@@ -421,7 +406,7 @@ fn base_worker_profile_host_pid(
 }
 
 #[cfg(test)]
-fn install_base_worker_profile_probe(scope: &mut v8::PinScope) -> Result<()> {
+pub(super) fn install_base_worker_profile_probe(scope: &mut v8::PinScope) -> Result<()> {
     const SOURCE: &str = r#"
 const pid = __base_worker_profile_host_pid();
 if (!Number.isInteger(pid) || pid <= 0) {
