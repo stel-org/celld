@@ -1909,6 +1909,24 @@ struct LoaderEnv {
     routes: Vec<LoaderEnvRoute>,
 }
 
+/// Closed, trusted choices for the JavaScript environment installed into a
+/// celld Worker isolate.  This is deliberately not a deployment field or a
+/// public API: callers that construct the existing `WorkerConfig` keep the
+/// default environment unless celld-internal code selects otherwise.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum WorkerRuntimeProfile {
+    #[default]
+    Default,
+    // B3.5.1 compiles this trusted choice now; its first production caller is
+    // deliberately deferred to Base-side selection in a later checkpoint.
+    #[allow(dead_code)]
+    BaseWorker,
+    /// Test-only failing initializer coverage. It is never compiled into the
+    /// shipping closed profile set.
+    #[cfg(test)]
+    BaseWorkerProbeFailure,
+}
+
 pub struct WorkerConfig {
     src: String,
     /// The canonical module name for `src`. Dynamic Workers preserve the
@@ -1943,6 +1961,9 @@ pub struct WorkerConfig {
     /// The worker's non-main modules, so the main module can import siblings.
     modules: Vec<(String, ModuleSource)>,
     compat: Compat,
+    /// Selected only by trusted celld construction code.  It changes the
+    /// profile bootstrap, never isolate ownership or runtime lifecycle.
+    runtime_profile: WorkerRuntimeProfile,
     /// `[[services]]`: (binding name, target script, optional entrypoint).
     /// The target runs in this process; see [[service-bindings]].
     services: Vec<(String, String, Option<String>)>,
@@ -2095,6 +2116,7 @@ impl WorkerConfig {
             node,
             modules,
             compat,
+            runtime_profile: WorkerRuntimeProfile::Default,
             services: Vec::new(),
             asset_binding: None,
             loader_bindings: Vec::new(),
@@ -2145,6 +2167,15 @@ impl WorkerConfig {
 
     pub fn with_containers(mut self, containers: Vec<crate::container::ContainerSpec>) -> Self {
         self.containers = containers;
+        self
+    }
+
+    /// Select a closed runtime bootstrap before this configuration is shared
+    /// by the stateless pool.  Base does not call this in B3.5.1; its existing
+    /// authenticated control path continues to construct `Default`.
+    #[allow(dead_code)]
+    pub(crate) fn with_runtime_profile(mut self, profile: WorkerRuntimeProfile) -> Self {
+        self.runtime_profile = profile;
         self
     }
 
@@ -5872,24 +5903,10 @@ impl Worker {
     }
 
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
-        #[cfg(test)]
-        return Self::load_config_inner(config, false);
-        #[cfg(not(test))]
         Self::load_config_inner(config)
     }
 
-    /// Exercises the proposed profile-initialization seam without compiling it
-    /// into the shipped celld binary.  The probe deliberately uses the same
-    /// V8 isolate, prelude, harness and module loader as `load_config`.
-    #[cfg(test)]
-    fn load_config_with_base_worker_profile_probe(config: Arc<WorkerConfig>) -> Result<Worker> {
-        Self::load_config_inner(config, true)
-    }
-
-    fn load_config_inner(
-        config: Arc<WorkerConfig>,
-        #[cfg(test)] base_worker_profile_probe: bool,
-    ) -> Result<Worker> {
+    fn load_config_inner(config: Arc<WorkerConfig>) -> Result<Worker> {
         let src = config.src.as_str();
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
@@ -5943,10 +5960,7 @@ impl Worker {
             let arguments = install_ops(scope, legacy_products);
             install_prelude(scope, &arguments)?; // Web Platform APIs
             install_harness(scope, &arguments, legacy_products)?; // core host + selected legacy products
-            #[cfg(test)]
-            if base_worker_profile_probe {
-                install_base_worker_profile_probe(scope)?;
-            }
+            bootstrap::install_runtime_profile(scope, config.runtime_profile)?;
             install_lazy_globals(scope)?;
             // A global, so it must exist before the module evaluates: bundles
             // read Cloudflare.compatibilityFlags at module scope.
@@ -6681,52 +6695,6 @@ fn install_ops<'s>(
         );
     }
     arguments
-}
-
-// This deliberately exists only in the unit-test build.  It models the
-// smallest profile-owned native operation using the implementation semantics
-// of Base Worker's Deno `op_bootstrap_pid`: a V8 callback returns the process
-// identifier.  It does not link deno_core (whose V8 ABI is different from
-// celld's), and it is not reachable from a shipping Worker.
-#[cfg(test)]
-fn base_worker_profile_host_pid(
-    scope: &mut v8::PinScope,
-    _args: v8::FunctionCallbackArguments,
-    mut return_value: v8::ReturnValue<v8::Value>,
-) {
-    return_value.set(v8::Number::new(scope, f64::from(std::process::id())).into());
-}
-
-/// Installs a profile-specific JavaScript surface after celld's required Web
-/// prelude and harness, but before the user module is evaluated.  The probe is
-/// intentionally not a second host: it runs inside the isolate created by
-/// `Worker::load_config` and receives its native capability as a lexical
-/// parameter, just as celld's own bootstrap scripts receive host operations.
-#[cfg(test)]
-fn install_base_worker_profile_probe(scope: &mut v8::PinScope) -> Result<()> {
-    const SOURCE: &str = r#"
-const pid = __base_worker_profile_host_pid();
-if (!Number.isInteger(pid) || pid <= 0) {
-  throw new TypeError("Base Worker profile native operation returned an invalid PID");
-}
-Object.defineProperty(globalThis, "BaseWorkerProfile", {
-  value: Object.freeze({ implementation: "deno-bootstrap-pid-probe", hostPid: pid }),
-  enumerable: false,
-  configurable: false,
-  writable: false,
-});
-"#;
-    let op_name = v8::String::new(scope, "__base_worker_profile_host_pid")
-        .ok_or_else(|| anyhow!("create Base Worker profile operation name"))?;
-    let op = v8::Function::new(scope, base_worker_profile_host_pid)
-        .ok_or_else(|| anyhow!("create Base Worker profile operation"))?;
-    let arguments = InternalArguments {
-        names: vec![op_name],
-        values: vec![op.into()],
-    };
-    let source = v8::String::new(scope, SOURCE)
-        .ok_or_else(|| anyhow!("create Base Worker profile bootstrap source"))?;
-    bootstrap::run_internal_script(scope, None, source, &arguments).map(|_| ())
 }
 
 /// The same arguments, rebuilt from the internals object for a script that
@@ -12851,23 +12819,26 @@ mod runtime_profile_feasibility_tests {
         INIT.call_once(crate::runtime::init_v8);
     }
 
-    fn config(source: &str) -> Arc<WorkerConfig> {
-        Arc::new(WorkerConfig::new(WorkerConfigOptions {
-            src: source.to_owned(),
-            script_name: "runtime-profile-feasibility".to_owned(),
-            do_classes: Vec::new(),
-            bindings: Vec::new(),
-            r2_bindings: Vec::new(),
-            d1_bindings: Vec::new(),
-            kv_bindings: Vec::new(),
-            queue_bindings: Vec::new(),
-            queue_consumers: Vec::new(),
-            workflow_bindings: Vec::new(),
-            vars: Vec::new(),
-            node: "runtime-profile-feasibility".to_owned(),
-            modules: Vec::new(),
-            compat: Compat::default(),
-        }))
+    fn config(source: &str, profile: WorkerRuntimeProfile) -> Arc<WorkerConfig> {
+        Arc::new(
+            WorkerConfig::new(WorkerConfigOptions {
+                src: source.to_owned(),
+                script_name: "runtime-profile-feasibility".to_owned(),
+                do_classes: Vec::new(),
+                bindings: Vec::new(),
+                r2_bindings: Vec::new(),
+                d1_bindings: Vec::new(),
+                kv_bindings: Vec::new(),
+                queue_bindings: Vec::new(),
+                queue_consumers: Vec::new(),
+                workflow_bindings: Vec::new(),
+                vars: Vec::new(),
+                node: "runtime-profile-feasibility".to_owned(),
+                modules: Vec::new(),
+                compat: Compat::default(),
+            })
+            .with_runtime_profile(profile),
+        )
     }
 
     #[test]
@@ -12881,10 +12852,11 @@ mod runtime_profile_feasibility_tests {
             }
             export default { fetch() { return new Response("default"); } };
             "#,
+            WorkerRuntimeProfile::Default,
         ))
         .expect("the existing default Worker path remains profile-free");
 
-        Worker::load_config_with_base_worker_profile_probe(config(
+        Worker::load_config(config(
             r#"
             if (typeof BaseWorkerProfile === "undefined") {
               throw new Error("profile initializer did not run");
@@ -12897,8 +12869,34 @@ mod runtime_profile_feasibility_tests {
             }
             export default { fetch() { return new Response("profile"); } };
             "#,
+            WorkerRuntimeProfile::BaseWorker,
         ))
         .expect("the profile JavaScript calls its native V8 callback before module evaluation");
+
+        Worker::load_config(config(
+            r#"
+            if (typeof BaseWorkerProfile !== "undefined") {
+              throw new Error("BaseWorker initialization contaminated a later default Worker");
+            }
+            export default { fetch() { return new Response("default-after-profile"); } };
+            "#,
+            WorkerRuntimeProfile::Default,
+        ))
+        .expect("BaseWorker initialization does not contaminate a later default isolate");
+
+        let error = match Worker::load_config(config(
+            r#"export default { fetch() { return new Response("unreachable"); } };"#,
+            WorkerRuntimeProfile::BaseWorkerProbeFailure,
+        )) {
+            Ok(_) => panic!("a failed selected profile initializer must refuse Worker loading"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("Base Worker profile probe initialization refused"),
+            "unexpected profile initialization error: {error:#}"
+        );
     }
 }
 

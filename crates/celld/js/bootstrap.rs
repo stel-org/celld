@@ -371,6 +371,82 @@ pub(super) fn install_harness<'s>(
     install_event_hooks(scope)
 }
 
+/// Install the closed runtime-profile contribution after the shared celld Web
+/// prelude and harness, and before application-module evaluation.  Profiles
+/// deliberately do not own V8 setup, operations, module loading, Cell state,
+/// or event lifecycle; those remain the common host.
+///
+/// Existing constructors select `Default`.  `BaseWorker` is production
+/// compiled so B3.5.2 can add reviewed APIs and adapters here, but B3.5.1
+/// intentionally exposes no Base Worker JavaScript product API.
+pub(super) fn install_runtime_profile(
+    scope: &mut v8::PinScope,
+    profile: WorkerRuntimeProfile,
+) -> Result<()> {
+    match profile {
+        WorkerRuntimeProfile::Default => Ok(()),
+        WorkerRuntimeProfile::BaseWorker => install_base_worker_profile(scope),
+        #[cfg(test)]
+        WorkerRuntimeProfile::BaseWorkerProbeFailure => {
+            Err(anyhow!("Base Worker profile probe initialization refused"))
+        }
+    }
+}
+
+fn install_base_worker_profile(scope: &mut v8::PinScope) -> Result<()> {
+    // A real internal-script evaluation marks the production bootstrap seam
+    // without making a global/API promise before B3.5.2 supplies one.
+    let source = v8::String::new(scope, "void 0;")
+        .ok_or_else(|| anyhow!("create Base Worker profile bootstrap source"))?;
+    let arguments = InternalArguments {
+        names: Vec::new(),
+        values: Vec::new(),
+    };
+    run_internal_script(scope, None, source, &arguments)?;
+    #[cfg(test)]
+    install_base_worker_profile_probe(scope)?;
+    Ok(())
+}
+
+// The probe remains test-only.  It models the smallest profile-owned native
+// operation using Base Worker's Deno `op_bootstrap_pid` semantics without
+// linking deno_core or exposing a shipping global.
+#[cfg(test)]
+fn base_worker_profile_host_pid(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut return_value: v8::ReturnValue<v8::Value>,
+) {
+    return_value.set(v8::Number::new(scope, f64::from(std::process::id())).into());
+}
+
+#[cfg(test)]
+fn install_base_worker_profile_probe(scope: &mut v8::PinScope) -> Result<()> {
+    const SOURCE: &str = r#"
+const pid = __base_worker_profile_host_pid();
+if (!Number.isInteger(pid) || pid <= 0) {
+  throw new TypeError("Base Worker profile native operation returned an invalid PID");
+}
+Object.defineProperty(globalThis, "BaseWorkerProfile", {
+  value: Object.freeze({ implementation: "deno-bootstrap-pid-probe", hostPid: pid }),
+  enumerable: false,
+  configurable: false,
+  writable: false,
+});
+"#;
+    let op_name = v8::String::new(scope, "__base_worker_profile_host_pid")
+        .ok_or_else(|| anyhow!("create Base Worker profile operation name"))?;
+    let op = v8::Function::new(scope, base_worker_profile_host_pid)
+        .ok_or_else(|| anyhow!("create Base Worker profile operation"))?;
+    let arguments = InternalArguments {
+        names: vec![op_name],
+        values: vec![op.into()],
+    };
+    let source = v8::String::new(scope, SOURCE)
+        .ok_or_else(|| anyhow!("create Base Worker profile probe source"))?;
+    run_internal_script(scope, None, source, &arguments).map(|_| ())
+}
+
 /// Resolve the per-event harness hooks once and hold them for the isolate.
 /// See [`EventHooks`] for why all four resolve together.
 fn install_event_hooks(scope: &mut v8::PinScope) -> Result<()> {
