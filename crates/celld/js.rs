@@ -5872,6 +5872,24 @@ impl Worker {
     }
 
     pub fn load_config(config: Arc<WorkerConfig>) -> Result<Worker> {
+        #[cfg(test)]
+        return Self::load_config_inner(config, false);
+        #[cfg(not(test))]
+        Self::load_config_inner(config)
+    }
+
+    /// Exercises the proposed profile-initialization seam without compiling it
+    /// into the shipped celld binary.  The probe deliberately uses the same
+    /// V8 isolate, prelude, harness and module loader as `load_config`.
+    #[cfg(test)]
+    fn load_config_with_base_worker_profile_probe(config: Arc<WorkerConfig>) -> Result<Worker> {
+        Self::load_config_inner(config, true)
+    }
+
+    fn load_config_inner(
+        config: Arc<WorkerConfig>,
+        #[cfg(test)] base_worker_profile_probe: bool,
+    ) -> Result<Worker> {
         let src = config.src.as_str();
         let script_name = config.script_name.as_str();
         let do_classes = config.do_classes.as_slice();
@@ -5925,6 +5943,10 @@ impl Worker {
             let arguments = install_ops(scope, legacy_products);
             install_prelude(scope, &arguments)?; // Web Platform APIs
             install_harness(scope, &arguments, legacy_products)?; // core host + selected legacy products
+            #[cfg(test)]
+            if base_worker_profile_probe {
+                install_base_worker_profile_probe(scope)?;
+            }
             install_lazy_globals(scope)?;
             // A global, so it must exist before the module evaluates: bundles
             // read Cloudflare.compatibilityFlags at module scope.
@@ -6659,6 +6681,52 @@ fn install_ops<'s>(
         );
     }
     arguments
+}
+
+// This deliberately exists only in the unit-test build.  It models the
+// smallest profile-owned native operation using the implementation semantics
+// of Base Worker's Deno `op_bootstrap_pid`: a V8 callback returns the process
+// identifier.  It does not link deno_core (whose V8 ABI is different from
+// celld's), and it is not reachable from a shipping Worker.
+#[cfg(test)]
+fn base_worker_profile_host_pid(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut return_value: v8::ReturnValue<v8::Value>,
+) {
+    return_value.set(v8::Number::new(scope, f64::from(std::process::id())).into());
+}
+
+/// Installs a profile-specific JavaScript surface after celld's required Web
+/// prelude and harness, but before the user module is evaluated.  The probe is
+/// intentionally not a second host: it runs inside the isolate created by
+/// `Worker::load_config` and receives its native capability as a lexical
+/// parameter, just as celld's own bootstrap scripts receive host operations.
+#[cfg(test)]
+fn install_base_worker_profile_probe(scope: &mut v8::PinScope) -> Result<()> {
+    const SOURCE: &str = r#"
+const pid = __base_worker_profile_host_pid();
+if (!Number.isInteger(pid) || pid <= 0) {
+  throw new TypeError("Base Worker profile native operation returned an invalid PID");
+}
+Object.defineProperty(globalThis, "BaseWorkerProfile", {
+  value: Object.freeze({ implementation: "deno-bootstrap-pid-probe", hostPid: pid }),
+  enumerable: false,
+  configurable: false,
+  writable: false,
+});
+"#;
+    let op_name = v8::String::new(scope, "__base_worker_profile_host_pid")
+        .ok_or_else(|| anyhow!("create Base Worker profile operation name"))?;
+    let op = v8::Function::new(scope, base_worker_profile_host_pid)
+        .ok_or_else(|| anyhow!("create Base Worker profile operation"))?;
+    let arguments = InternalArguments {
+        names: vec![op_name],
+        values: vec![op.into()],
+    };
+    let source = v8::String::new(scope, SOURCE)
+        .ok_or_else(|| anyhow!("create Base Worker profile bootstrap source"))?;
+    bootstrap::run_internal_script(scope, None, source, &arguments).map(|_| ())
 }
 
 /// The same arguments, rebuilt from the internals object for a script that
@@ -12770,6 +12838,68 @@ fn read_response(scope: &mut v8::PinScope, ret: v8::Local<v8::Value>) -> Result<
         write_position: None,
         observed_position: None,
     })
+}
+
+#[cfg(test)]
+mod runtime_profile_feasibility_tests {
+    use super::*;
+    use crate::engine_api::{Compat, WorkerConfigOptions};
+    use std::sync::{Arc, Once};
+
+    fn init_v8() {
+        static INIT: Once = Once::new();
+        INIT.call_once(crate::runtime::init_v8);
+    }
+
+    fn config(source: &str) -> Arc<WorkerConfig> {
+        Arc::new(WorkerConfig::new(WorkerConfigOptions {
+            src: source.to_owned(),
+            script_name: "runtime-profile-feasibility".to_owned(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "runtime-profile-feasibility".to_owned(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        }))
+    }
+
+    #[test]
+    fn base_worker_profile_probe_isolated_from_default_worker_loading() {
+        init_v8();
+
+        Worker::load_config(config(
+            r#"
+            if (typeof BaseWorkerProfile !== "undefined") {
+              throw new Error("default Worker inherited the profile probe");
+            }
+            export default { fetch() { return new Response("default"); } };
+            "#,
+        ))
+        .expect("the existing default Worker path remains profile-free");
+
+        Worker::load_config_with_base_worker_profile_probe(config(
+            r#"
+            if (typeof BaseWorkerProfile === "undefined") {
+              throw new Error("profile initializer did not run");
+            }
+            if (BaseWorkerProfile.implementation !== "deno-bootstrap-pid-probe") {
+              throw new Error("unexpected profile implementation");
+            }
+            if (!Number.isInteger(BaseWorkerProfile.hostPid) || BaseWorkerProfile.hostPid <= 0) {
+              throw new Error("profile native operation did not return a PID");
+            }
+            export default { fetch() { return new Response("profile"); } };
+            "#,
+        ))
+        .expect("the profile JavaScript calls its native V8 callback before module evaluation");
+    }
 }
 
 #[cfg(celld_internal_tests)]
