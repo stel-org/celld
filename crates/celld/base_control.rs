@@ -13,7 +13,7 @@
 
 use crate::actor::{AppHandle, LocalRequestFailure, Routed};
 use crate::engine_api::{Compat, RequestBody, RuntimeFetch, WorkerConfigOptions};
-use crate::js::WorkerConfig;
+use crate::js::{WorkerConfig, WorkerRuntimeProfile};
 use crate::runtime::StatelessRuntime;
 use crate::worker_realization::{
     bounded_response, InvokeError, LocalPresence, RealizationMetadata, RetireResult,
@@ -50,7 +50,9 @@ const OBSERVATION_PROTOCOL_VERSION: u32 = 2;
 const WORKER_EXECUTION_PROTOCOL_VERSION: u32 = 3;
 /// Managed Worker realizations deliberately use a new contract: v3 remains
 /// the pre-existing, one-off stateless execution operation.
-const WORKER_REALIZATION_PROTOCOL_VERSION: u32 = 4;
+const WORKER_REALIZATION_PROTOCOL_VERSION_V4: u32 = 4;
+const WORKER_REALIZATION_PROTOCOL_VERSION_V5: u32 = 5;
+const BASE_WORKER_PROFILE_CONTRACT: &str = "base-worker/celld-base-worker-esm-v1";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_WORKER_ARTIFACT_BYTES: usize = 512 * 1024;
 const MAX_WORKER_RESPONSE_BYTES: usize = 64 * 1024;
@@ -142,6 +144,10 @@ struct WorkerRealizationRequest {
     artifact_bytes: Option<usize>,
     url: Option<String>,
     method: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+    #[serde(default)]
+    execution_contract: Option<String>,
     nonce: String,
     proof: String,
 }
@@ -226,6 +232,10 @@ struct WorkerRealizationResponse<'a> {
     body_base64: Option<String>,
     body_sha256: Option<String>,
     body_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_contract: Option<&'a str>,
     nonce: &'a str,
     proof: String,
 }
@@ -908,7 +918,10 @@ async fn handle_worker_realization(
     };
     if !supported
         || request.protocol != PROTOCOL
-        || request.protocol_version != WORKER_REALIZATION_PROTOCOL_VERSION
+        || !matches!(
+            request.protocol_version,
+            WORKER_REALIZATION_PROTOCOL_VERSION_V4 | WORKER_REALIZATION_PROTOCOL_VERSION_V5
+        )
         || !identities_valid
         || !valid_digest(&request.artifact_sha256)
         || !artifact_shape
@@ -927,6 +940,21 @@ async fn handle_worker_realization(
         )
         .await;
     }
+    // Admission of a profile is deliberately after request authentication:
+    // profile and contract are part of the signed v5 material and are not a
+    // caller-controlled bootstrap selector.
+    let profile = match realization_profile(&request) {
+        Some(profile) => profile,
+        None => {
+            return write_json(
+                &mut stream,
+                &Rejection {
+                    error: "authentication_rejected",
+                },
+            )
+            .await
+        }
+    };
     if request.operation != "inspectWorkerRealization"
         && !replay_guard.record_if_new(format!(
             "{}:{}:{}",
@@ -948,6 +976,14 @@ async fn handle_worker_realization(
         branch_id: request.branch_id.clone(),
         cell_id: request.cell_id.clone(),
         artifact_sha256: request.artifact_sha256.clone(),
+        runtime_profile: request
+            .profile
+            .clone()
+            .unwrap_or_else(|| "default".to_owned()),
+        execution_contract: request
+            .execution_contract
+            .clone()
+            .unwrap_or_else(|| "base-worker/celld-browser-esm-v1".to_owned()),
     };
     let outcome = match request.operation.as_str() {
         "establishWorkerRealization" => {
@@ -994,7 +1030,8 @@ async fn handle_worker_realization(
                 node: "base-worker-control".to_owned(),
                 modules: Vec::new(),
                 compat: Compat::default(),
-            });
+            })
+            .with_runtime_profile(profile);
             match StatelessRuntime::start(
                 Arc::new(config),
                 Arc::from("base-worker-control"),
@@ -1059,6 +1096,25 @@ async fn handle_worker_realization(
     .await
 }
 
+/// Maps only authenticated, closed protocol combinations to celld's private
+/// bootstrap selector. v4 has no profile fields and remains Default forever;
+/// v5 currently admits only the deliberately narrow BaseWorker contract.
+fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRuntimeProfile> {
+    match (
+        request.protocol_version,
+        request.profile.as_deref(),
+        request.execution_contract.as_deref(),
+    ) {
+        (WORKER_REALIZATION_PROTOCOL_VERSION_V4, None, None) => Some(WorkerRuntimeProfile::Default),
+        (
+            WORKER_REALIZATION_PROTOCOL_VERSION_V5,
+            Some("base-worker"),
+            Some(BASE_WORKER_PROFILE_CONTRACT),
+        ) => Some(WorkerRuntimeProfile::BaseWorker),
+        _ => None,
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the signed response explicitly names all independently authenticated fields"
@@ -1083,7 +1139,7 @@ async fn write_worker_realization_response(
     let response = WorkerRealizationResponse {
         operation: &request.operation,
         protocol: PROTOCOL,
-        protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION,
+        protocol_version: request.protocol_version,
         installation_id,
         implementation: "celld",
         implementation_version: env!("CARGO_PKG_VERSION"),
@@ -1099,6 +1155,8 @@ async fn write_worker_realization_response(
         body_base64,
         body_sha256,
         body_bytes,
+        profile: request.profile.as_deref(),
+        execution_contract: request.execution_contract.as_deref(),
         nonce: &request.nonce,
         proof: sign(
             secret,
@@ -1413,8 +1471,9 @@ fn worker_execution_response_material(
 }
 
 fn worker_realization_request_material(request: &WorkerRealizationRequest) -> String {
-    format!(
-        "worker-realization:{PROTOCOL}:{WORKER_REALIZATION_PROTOCOL_VERSION}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+    let legacy = format!(
+        "worker-realization:{PROTOCOL}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        request.protocol_version,
         request.operation,
         request.realization_id,
         request.project_id,
@@ -1422,11 +1481,21 @@ fn worker_realization_request_material(request: &WorkerRealizationRequest) -> St
         request.branch_id,
         request.cell_id,
         request.artifact_sha256,
-        request.artifact_bytes.map_or_else(String::new, |value| value.to_string()),
+        request
+            .artifact_bytes
+            .map_or_else(String::new, |value| value.to_string()),
         request.method.as_deref().unwrap_or(""),
         request.url.as_deref().unwrap_or(""),
         request.nonce,
         "",
+    );
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V4 {
+        return legacy;
+    }
+    format!(
+        "{legacy}:{}:{}",
+        request.profile.as_deref().unwrap_or(""),
+        request.execution_contract.as_deref().unwrap_or("")
     )
 }
 
@@ -1444,8 +1513,9 @@ fn worker_realization_response_material(
     body_sha256: Option<String>,
     body_bytes: Option<usize>,
 ) -> String {
-    format!(
-        "worker-realization-response:{PROTOCOL}:{WORKER_REALIZATION_PROTOCOL_VERSION}:{}:{installation_id}:celld:{implementation_version}:{process_instance_id}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+    let legacy = format!(
+        "worker-realization-response:{PROTOCOL}:{}:{}:{installation_id}:celld:{implementation_version}:{process_instance_id}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        request.protocol_version,
         request.operation,
         request.realization_id,
         request.project_id,
@@ -1458,6 +1528,14 @@ fn worker_realization_response_material(
         body_sha256.unwrap_or_default(),
         body_bytes.map_or_else(String::new, |value| value.to_string()),
         request.nonce,
+    );
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V4 {
+        return legacy;
+    }
+    format!(
+        "{legacy}:{}:{}",
+        request.profile.as_deref().unwrap_or(""),
+        request.execution_contract.as_deref().unwrap_or("")
     )
 }
 
@@ -1618,6 +1696,77 @@ mod tests {
             &worker_execution_request_material(&changed),
             &proof
         ));
+    }
+
+    fn profile_request() -> WorkerRealizationRequest {
+        WorkerRealizationRequest {
+            operation: "establishWorkerRealization".to_owned(),
+            protocol: PROTOCOL.to_owned(),
+            protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION_V5,
+            realization_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            project_id: "11234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            worker_id: "21234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            branch_id: "31234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            cell_id: "41234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            artifact_sha256: "a".repeat(64),
+            artifact_bytes: Some(12),
+            url: None,
+            method: None,
+            profile: Some("base-worker".to_owned()),
+            execution_contract: Some(BASE_WORKER_PROFILE_CONTRACT.to_owned()),
+            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            proof: String::new(),
+        }
+    }
+
+    #[test]
+    fn realization_v5_proof_binds_profile_and_execution_contract() {
+        let secret = [7_u8; 32];
+        let request = profile_request();
+        let proof = sign(&secret, &worker_realization_request_material(&request));
+        assert!(verify(
+            &secret,
+            &worker_realization_request_material(&request),
+            &proof
+        ));
+
+        let mut changed = profile_request();
+        changed.profile = Some("default".to_owned());
+        assert!(!verify(
+            &secret,
+            &worker_realization_request_material(&changed),
+            &proof
+        ));
+        changed.profile = Some("base-worker".to_owned());
+        changed.execution_contract = Some("base-worker/celld-browser-esm-v1".to_owned());
+        assert!(!verify(
+            &secret,
+            &worker_realization_request_material(&changed),
+            &proof
+        ));
+    }
+
+    #[test]
+    fn realization_profile_admission_is_closed_and_v4_is_default_only() {
+        let profile = profile_request();
+        assert_eq!(
+            realization_profile(&profile),
+            Some(WorkerRuntimeProfile::BaseWorker)
+        );
+        let mut wrong_contract = profile_request();
+        wrong_contract.execution_contract = Some("base-worker/celld-browser-esm-v1".to_owned());
+        assert_eq!(realization_profile(&wrong_contract), None);
+
+        let mut historical = profile_request();
+        historical.protocol_version = WORKER_REALIZATION_PROTOCOL_VERSION_V4;
+        historical.profile = None;
+        historical.execution_contract = None;
+        assert_eq!(
+            realization_profile(&historical),
+            Some(WorkerRuntimeProfile::Default)
+        );
+        historical.profile = Some("base-worker".to_owned());
+        assert_eq!(realization_profile(&historical), None);
     }
 
     #[test]

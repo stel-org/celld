@@ -32,6 +32,8 @@ pub struct RealizationMetadata {
     pub branch_id: String,
     pub cell_id: String,
     pub artifact_sha256: String,
+    pub runtime_profile: String,
+    pub execution_contract: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
