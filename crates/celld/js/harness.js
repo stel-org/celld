@@ -3671,6 +3671,25 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
   return binding;
 };
 
+// Base retained-realization Service Bindings are intentionally separate from
+// celld's deployment-local `__makeServiceBinding` graph. `name` is only a
+// requested Base Binding name; it is not a target script, Resource ID, or
+// authority snapshot. The host derives the source realization identity.
+const __makeBaseServiceBinding = __celld.__makeBaseServiceBinding =
+  (name) => ({
+    async fetch(input, init) {
+      const req = new Request(input, init);
+      const body = new Uint8Array(await req.arrayBuffer());
+      const headers = req.headers.__celldHeaderList;
+      const allowed = headers.filter(([key]) => key.toLowerCase() === "content-type");
+      if (allowed.length !== headers.length)
+        throw new TypeError("Base Service Bindings support only Content-Type request headers");
+      const r = JSON.parse(await __base_service_call(
+        name, req.url, req.method, body, JSON.stringify(allowed)));
+      return new Response(Uint8Array.from(r.bodyBytes || []), { status: r.status });
+    },
+  });
+
 __celld.__installLoaderEnv = (bytes, routes) => {
   const env = __sc_decode(bytes);
   const seen = new Set();

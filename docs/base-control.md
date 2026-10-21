@@ -133,6 +133,33 @@ secret stop ordinary other-user access and unauthenticated responders. A process
 with equivalent Unix account and filesystem authority that can read the secret
 is already inside the pairing boundary.
 
+## B3.8.6 verified Base Workload Binding bridge
+
+Base-managed retained realizations receive a celld host capability distinct
+from celld deployment-graph service bindings. JavaScript can request only a
+Binding name plus a bounded request through `env.NAME.fetch`; celld derives
+the Project, Worker, Branch, realization, installation, and current
+process-instance identity from the retained realization configuration. Those
+facts cannot be supplied or replaced by JavaScript.
+
+celld sends the request only to `base-workload.sock` in the paired private
+control directory. `base-workload-callback` v1 is an independently
+domain-separated HMAC protocol, not a reinterpretation of v4/v5 lifecycle or
+v6 Base-to-celld delivery. It length-prefixes protocol/version/operation,
+installation/process, source realization context, Binding name, method,
+path/query, optional content type, body length/digest, and nonce. The request
+is limited to five methods, a `https://service.internal` path/query of 2,048
+bytes, sole optional `Content-Type` of 256 bytes, and 64 KiB body/response.
+There are no arbitrary headers, streaming, WebSockets, target IDs, pairing
+secret exposure, or outbound internet authority.
+
+Base owns current Binding authorization and target selection. A missing,
+revoked, retargeted, wrong-scope, or Secret-target Binding is refused by Base;
+celld never routes this through `RuntimeManager::fetch_service` or its native
+service graph. A Base callback failure is a rejected/uncertain operation, not
+a fallback to an unprotected path. The capability is absent from ordinary
+celld Workers and dynamically loaded isolates.
+
 ## B3.2.1 bounded Base Worker invocation
 
 Protocol version 3 adds one separately authenticated operation,

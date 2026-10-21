@@ -798,6 +798,15 @@ pub(super) fn build_env(scope: &mut v8::PinScope, config: &WorkerConfig) -> Resu
                 binding, script, entrypoint
             ));
         }
+        if config.base_workload.is_some() {
+            // Base Workload Bindings are deliberately not celld deployment
+            // services. This proxy merely provides ergonomic `env.NAME`
+            // syntax; every actual call is authenticated back to Base and
+            // must resolve a current Base Binding by this name.
+            lines.push_str(
+                "Object.setPrototypeOf(e, new Proxy({}, { get(_target, name) { return typeof name === 'string' ? __celld.__makeBaseServiceBinding(name) : undefined; } }));\n",
+            );
+        }
         for (name, value) in vars {
             lines.push_str(&format!("e[{:?}] = {:?};\n", name, value));
         }

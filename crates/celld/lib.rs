@@ -26,6 +26,7 @@ pub mod assets;
 pub mod asyncrt;
 pub mod base_control;
 pub mod base_worker_artifact;
+pub(crate) mod base_workload;
 // The internal test flag alone selects the simulated asyncrt, so an external
 // test harness built with the flag sees the same simulated world the
 // in-crate suites see. `test` must not be part of the gate:

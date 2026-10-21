@@ -14,6 +14,7 @@
 //! async in JS, synchronous underneath — the ops are sync Rust, wrapped in
 //! `async` by the JS harness.
 use crate::asyncrt;
+use crate::base_workload::BaseWorkloadContext;
 use crate::storage;
 use anyhow::{anyhow, Context as _, Result};
 use std::cell::RefCell;
@@ -1967,6 +1968,10 @@ pub struct WorkerConfig {
     /// `[[services]]`: (binding name, target script, optional entrypoint).
     /// The target runs in this process; see [[service-bindings]].
     services: Vec<(String, String, Option<String>)>,
+    /// A Base-only retained-realization callback capability. It is selected
+    /// only by the authenticated Base control adapter and is never populated
+    /// by deployment configuration or application JavaScript.
+    base_workload: Option<Arc<BaseWorkloadContext>>,
     asset_binding: Option<String>,
     /// `env` names of the Worker Loader bindings, if this Worker can spawn
     /// dynamic isolates. A config can declare more than one loader, and each
@@ -2118,6 +2123,7 @@ impl WorkerConfig {
             compat,
             runtime_profile: WorkerRuntimeProfile::Default,
             services: Vec::new(),
+            base_workload: None,
             asset_binding: None,
             loader_bindings: Vec::new(),
             egress: EgressPolicy::Allow,
@@ -2260,6 +2266,11 @@ impl WorkerConfig {
     /// Declare the service bindings this Worker may call.
     pub fn with_services(mut self, services: Vec<(String, String, Option<String>)>) -> Self {
         self.services = services;
+        self
+    }
+
+    pub(crate) fn with_base_workload(mut self, context: BaseWorkloadContext) -> Self {
+        self.base_workload = Some(Arc::new(context));
         self
     }
 
@@ -5941,6 +5952,9 @@ impl Worker {
         isolate.set_slot(config.legacy_products());
         isolate.set_slot(loader_owner.clone());
         isolate.set_slot(crate::generation::GenerationTag(config.generation));
+        if let Some(base_workload) = &config.base_workload {
+            isolate.set_slot(base_workload.clone());
+        }
         // Retains the config so `/bundle` can project it later. Nothing is
         // walked or copied here: a worker that never reads its own bundle pays
         // only this `Arc` clone.
@@ -6946,6 +6960,7 @@ ops! { OP_NAMES, install_op_functions,
         "__do_call" => op_do_call,
         "__svc_call" => op_svc_call,
         "__svc_call_cancellable" => op_svc_call_cancellable,
+        "__base_service_call" => op_base_service_call,
         "__svc_rpc" => op_svc_rpc,
         "__queue_dispatch" => op_queue_dispatch,
         "__queue_policy" => op_queue_policy,
@@ -7260,6 +7275,66 @@ fn op_svc_call_cancellable(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     op_svc_call_impl(scope, args, &mut rv, true);
+}
+
+/// `__base_service_call(binding, url, method, body, contentTypeHeaders)` ->
+/// Promise<json>. Unlike celld's native Service graph, this can exist only in
+/// a Base-authenticated retained realization and sends a separately signed
+/// callback to Base. JavaScript supplies only a Binding name and bounded
+/// request shape; it cannot select or alter the source identity.
+fn op_base_service_call(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Err(error) = event_context(scope).charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
+    let Some(context) = scope.get_slot::<Arc<BaseWorkloadContext>>().cloned() else {
+        return loader_throw(
+            scope,
+            "Base Service Bindings are unavailable in this Worker",
+        );
+    };
+    let binding = args.get(0).to_rust_string_lossy(scope);
+    let url = args.get(1).to_rust_string_lossy(scope);
+    let method = args.get(2).to_rust_string_lossy(scope);
+    let Some(body) = view_bytes(args.get(3)) else {
+        return loader_throw(
+            scope,
+            "Base Service Binding request body is not a typed array",
+        );
+    };
+    let headers: Vec<(String, String)> =
+        match serde_json::from_str(&args.get(4).to_rust_string_lossy(scope)) {
+            Ok(headers) => headers,
+            Err(_) => {
+                return loader_throw(scope, "Base Service Binding request headers are invalid")
+            }
+        };
+    let content_type = match headers.as_slice() {
+        [] => None,
+        [(name, value)] if name.eq_ignore_ascii_case("content-type") => Some(value.clone()),
+        _ => {
+            return loader_throw(
+                scope,
+                "Base Service Bindings support only one Content-Type header",
+            )
+        }
+    };
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
+        let response = context
+            .dispatch(binding, url, method, content_type, body)
+            .await?;
+        let reply = serde_json::json!({
+            "status": response.status,
+            "bodyBytes": response.body,
+        });
+        Ok(asyncrt::OpOut::Str(reply.to_string()))
+    });
+    rv.set(promise_for(scope, id));
 }
 
 fn op_svc_call_impl(

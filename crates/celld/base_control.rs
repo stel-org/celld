@@ -12,6 +12,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use crate::actor::{AppHandle, LocalRequestFailure, Routed};
+use crate::base_workload::BaseWorkloadContext;
 use crate::engine_api::{Compat, RequestBody, RuntimeFetch, WorkerConfigOptions};
 use crate::js::{WorkerConfig, WorkerRuntimeProfile};
 use crate::runtime::StatelessRuntime;
@@ -40,6 +41,7 @@ use tokio::task::JoinHandle;
 
 const CONTROL_DIRECTORY: &str = "CELLD_BASE_CONTROL_DIR";
 const SOCKET_NAME: &str = "base-control.sock";
+const WORKLOAD_CALLBACK_SOCKET_NAME: &str = "base-workload.sock";
 const INSTALLATION_ID_NAME: &str = "base-installation-id";
 const SECRET_NAME: &str = "base-control.secret";
 const PROTOCOL: &str = "base-celld";
@@ -90,6 +92,7 @@ impl Drop for BaseControlServer {
 
 struct ControlDirectory {
     socket_path: PathBuf,
+    workload_callback_socket_path: PathBuf,
     installation_id: String,
     secret: Vec<u8>,
 }
@@ -332,6 +335,7 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
             let app = app.clone();
             let installation_id = control.installation_id.clone();
             let secret = control.secret.clone();
+            let workload_callback_socket_path = control.workload_callback_socket_path.clone();
             let process_instance_id = process_instance_id.clone();
             let replay_guard = replay_guard.clone();
             let realizations = realizations.clone();
@@ -342,6 +346,7 @@ pub async fn start_from_environment(app: AppHandle) -> anyhow::Result<Option<Bas
                     app,
                     &installation_id,
                     &secret,
+                    &workload_callback_socket_path,
                     &process_instance_id,
                     replay_guard,
                     realizations,
@@ -396,6 +401,7 @@ impl ControlDirectory {
         let secret = read_or_create_secret(&directory.join(SECRET_NAME))?;
         Ok(Self {
             socket_path: directory.join(SOCKET_NAME),
+            workload_callback_socket_path: directory.join(WORKLOAD_CALLBACK_SOCKET_NAME),
             installation_id,
             secret,
         })
@@ -516,11 +522,16 @@ fn validate_installation_id(id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the UDS adapter explicitly receives each transport trust-boundary dependency"
+)]
 async fn handle_control(
     mut stream: UnixStream,
     app: AppHandle,
     installation_id: &str,
     secret: &[u8],
+    workload_callback_socket_path: &Path,
     process_instance_id: &str,
     replay_guard: Arc<ReplayGuard>,
     realizations: Arc<WorkerRealizationRegistry>,
@@ -538,6 +549,7 @@ async fn handle_control(
             app,
             installation_id,
             secret,
+            workload_callback_socket_path,
             process_instance_id,
             replay_guard,
             realizations,
@@ -599,6 +611,7 @@ async fn handle_execution(
     app: AppHandle,
     installation_id: &str,
     secret: &[u8],
+    workload_callback_socket_path: &Path,
     process_instance_id: &str,
     replay_guard: Arc<ReplayGuard>,
     realizations: Arc<WorkerRealizationRegistry>,
@@ -630,6 +643,7 @@ async fn handle_execution(
             stream,
             installation_id,
             secret,
+            workload_callback_socket_path,
             process_instance_id,
             replay_guard,
             realizations,
@@ -889,10 +903,15 @@ async fn execute_worker_artifact(
     write_json(stream, &response).await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the UDS adapter explicitly receives each retained-realization trust dependency"
+)]
 async fn handle_worker_realization(
     mut stream: UnixStream,
     installation_id: &str,
     secret: &[u8],
+    workload_callback_socket_path: &Path,
     process_instance_id: &str,
     replay_guard: Arc<ReplayGuard>,
     realizations: Arc<WorkerRealizationRegistry>,
@@ -1070,7 +1089,14 @@ async fn handle_worker_realization(
                 modules: Vec::new(),
                 compat: Compat::default(),
             })
-            .with_runtime_profile(profile);
+            .with_runtime_profile(profile)
+            .with_base_workload(BaseWorkloadContext::new(
+                workload_callback_socket_path.to_owned(),
+                installation_id.to_owned(),
+                process_instance_id.to_owned(),
+                Arc::from(secret),
+                metadata.clone(),
+            ));
             match StatelessRuntime::start(
                 Arc::new(config),
                 Arc::from("base-worker-control"),
