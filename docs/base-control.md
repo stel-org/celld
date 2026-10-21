@@ -160,6 +160,30 @@ service graph. A Base callback failure is a rejected/uncertain operation, not
 a fallback to an unprotected path. The capability is absent from ordinary
 celld Workers and dynamically loaded isolates.
 
+## B3.8.7 verified Base Secret Binding bridge
+
+The same Base-retained realization capability also provides
+`env.NAME.get()`. This is not a URL fetch and cannot select a Secret ID,
+Project, Worker, Branch or realization. celld sends a separate
+`readSecretBinding` request to the same private `base-workload.sock`; its
+version-2 request has a distinct HMAC domain label and binds the retained
+source context, Binding name and fresh nonce. It does not reuse or alter the
+version-1 Worker-dispatch material.
+
+Base alone resolves the current Binding and decrypts an authorized Secret. A
+successful response is not a generic JSON body: Base seals it with
+XChaCha20-Poly1305 using a key derived with a separate label from the local
+Base–celld pairing secret. The response nonce and associated data bind the
+original request context. celld verifies it before passing UTF-8 text to the
+calling V8 Worker. The Base Secrets master key never enters celld, JavaScript,
+Build artifacts or deployment configuration.
+
+Secret reads are on-demand, bounded to 64 KiB, and not cached. A revoked
+Binding blocks a later read but cannot erase an already delivered JavaScript
+string. A Worker receiving a permitted Base Worker call may read its own bound
+Secret; it still cannot initiate another Worker dispatch under the B3.8.6
+one-hop restriction. Ordinary celld Workers retain no Base Secret capability.
+
 ## B3.2.1 bounded Base Worker invocation
 
 Protocol version 3 adds one separately authenticated operation,

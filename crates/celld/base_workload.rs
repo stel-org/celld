@@ -8,6 +8,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
+use chacha20poly1305::{
+    aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
+};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -21,6 +25,9 @@ use crate::worker_realization::RealizationMetadata;
 const PROTOCOL: &str = "base-workload-callback";
 const PROTOCOL_VERSION: u32 = 1;
 const OPERATION: &str = "dispatchServiceBinding";
+const SECRET_PROTOCOL_VERSION: u32 = 2;
+const SECRET_OPERATION: &str = "readSecretBinding";
+const SECRET_RESPONSE_KEY_LABEL: &[u8] = b"base-workload-secret-response-key-v1";
 const MAX_METADATA_BYTES: usize = 8 * 1024;
 const MAX_RESPONSE_BYTES: usize = 96 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -141,6 +148,92 @@ impl BaseWorkloadContext {
             .map_err(|_| "Base Service request outcome is unknown".to_owned())?
             .map_err(|_| "Base Service request was rejected".to_owned())
     }
+
+    /// Reads one Secret through a current Base Binding. JavaScript chooses
+    /// only the binding name; all source facts come from this retained
+    /// realization's trusted metadata. The response is separately sealed so
+    /// plaintext never enters the generic dispatch response format.
+    pub(crate) async fn read_secret(&self, binding_name: String) -> Result<Vec<u8>, String> {
+        if !valid_binding_name(&binding_name) {
+            return Err("Base Secret Binding request is invalid".to_owned());
+        }
+        let nonce =
+            nonce().map_err(|_| "Base Secret Binding request could not be prepared".to_owned())?;
+        let mut request = SecretCallbackRequest {
+            protocol: PROTOCOL,
+            protocol_version: SECRET_PROTOCOL_VERSION,
+            operation: SECRET_OPERATION,
+            installation_id: &self.installation_id,
+            process_instance_id: &self.process_instance_id,
+            project_id: &self.metadata.project_id,
+            worker_id: &self.metadata.worker_id,
+            branch_id: &self.metadata.branch_id,
+            realization_id: &self.metadata.realization_id,
+            binding_name: &binding_name,
+            nonce: &nonce,
+            proof: String::new(),
+        };
+        request.proof = sign(&self.secret, &secret_callback_material(&request));
+        let operation = async {
+            let mut stream = UnixStream::connect(&self.socket_path)
+                .await
+                .context("connect Base Secret callback")?;
+            write_json(&mut stream, &request).await?;
+            let response = read_line(&mut stream, MAX_RESPONSE_BYTES).await?;
+            let response: SecretCallbackResponse =
+                serde_json::from_slice(&response).context("decode Base Secret response")?;
+            if response.protocol != PROTOCOL
+                || response.protocol_version != SECRET_PROTOCOL_VERSION
+                || response.operation != SECRET_OPERATION
+            {
+                bail!("Base Secret callback returned an invalid response");
+            }
+            if response.outcome != "confirmed" {
+                bail!("Base Secret callback rejected the request");
+            }
+            let nonce = hex::decode(
+                response
+                    .nonce
+                    .ok_or_else(|| anyhow!("Base Secret response lacks nonce"))?,
+            )?;
+            if nonce.len() != 24 {
+                bail!("Base Secret response nonce is invalid");
+            }
+            let ciphertext = base64::engine::general_purpose::STANDARD
+                .decode(
+                    response
+                        .ciphertext_base64
+                        .ok_or_else(|| anyhow!("Base Secret response lacks ciphertext"))?,
+                )
+                .context("decode Base Secret ciphertext")?;
+            // XChaCha20-Poly1305 has a 16-byte authentication tag. The
+            // encrypted transport response is bounded before allocation by
+            // the line limit and again here before decryption.
+            if !(16..=MAX_BODY_BYTES + 16).contains(&ciphertext.len()) {
+                bail!("Base Secret response exceeds bound");
+            }
+            let key = secret_response_key(&self.secret)?;
+            let cipher = XChaCha20Poly1305::new_from_slice(&key)
+                .map_err(|_| anyhow!("Base Secret transport key is invalid"))?;
+            let plaintext = cipher
+                .decrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &ciphertext,
+                        aad: secret_response_associated_data(&request).as_bytes(),
+                    },
+                )
+                .map_err(|_| anyhow!("Base Secret response authentication failed"))?;
+            if plaintext.len() > MAX_BODY_BYTES {
+                bail!("Base Secret response exceeds bound");
+            }
+            Ok(plaintext)
+        };
+        crate::asyncrt::timeout(CALLBACK_TIMEOUT, operation)
+            .await
+            .map_err(|_| "Base Secret Binding request timed out".to_owned())?
+            .map_err(|_| "Base Secret Binding request was rejected".to_owned())
+    }
 }
 
 pub(crate) struct BaseWorkloadResponse {
@@ -183,6 +276,36 @@ struct CallbackResponse {
     error: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecretCallbackRequest<'a> {
+    protocol: &'static str,
+    protocol_version: u32,
+    operation: &'static str,
+    installation_id: &'a str,
+    process_instance_id: &'a str,
+    project_id: &'a str,
+    worker_id: &'a str,
+    branch_id: &'a str,
+    realization_id: &'a str,
+    binding_name: &'a str,
+    nonce: &'a str,
+    proof: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SecretCallbackResponse {
+    protocol: String,
+    protocol_version: u32,
+    operation: String,
+    outcome: String,
+    nonce: Option<String>,
+    ciphertext_base64: Option<String>,
+    #[allow(dead_code)]
+    error: Option<String>,
+}
+
 fn callback_material(request: &CallbackRequest<'_>) -> String {
     canonical_material(
         "celld-to-base-workload-callback-v1",
@@ -207,6 +330,44 @@ fn callback_material(request: &CallbackRequest<'_>) -> String {
     )
 }
 
+fn secret_callback_material(request: &SecretCallbackRequest<'_>) -> String {
+    canonical_material(
+        "celld-to-base-secret-consumption-v1",
+        &[
+            request.protocol,
+            &request.protocol_version.to_string(),
+            request.operation,
+            request.installation_id,
+            request.process_instance_id,
+            request.project_id,
+            request.worker_id,
+            request.branch_id,
+            request.realization_id,
+            request.binding_name,
+            request.nonce,
+        ],
+    )
+}
+
+fn secret_response_associated_data(request: &SecretCallbackRequest<'_>) -> String {
+    canonical_material(
+        "base-to-celld-secret-response-aad-v1",
+        &[
+            request.protocol,
+            &request.protocol_version.to_string(),
+            request.operation,
+            request.installation_id,
+            request.process_instance_id,
+            request.project_id,
+            request.worker_id,
+            request.branch_id,
+            request.realization_id,
+            request.binding_name,
+            request.nonce,
+        ],
+    )
+}
+
 fn canonical_material(label: &str, fields: &[&str]) -> String {
     let mut material = String::from(label);
     for value in fields {
@@ -219,9 +380,19 @@ fn canonical_material(label: &str, fields: &[&str]) -> String {
 }
 
 fn sign(secret: &[u8], material: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("Base pairing secret is valid");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(secret).expect("Base pairing secret is valid");
     mac.update(material.as_bytes());
     hex::encode(mac.finalize().into_bytes())
+}
+
+fn secret_response_key(secret: &[u8]) -> anyhow::Result<[u8; 32]> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret)?;
+    mac.update(SECRET_RESPONSE_KEY_LABEL);
+    let bytes = mac.finalize().into_bytes();
+    let mut key = [0_u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 fn path_from_service_url(value: &str) -> Result<String, String> {

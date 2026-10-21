@@ -6961,6 +6961,7 @@ ops! { OP_NAMES, install_op_functions,
         "__svc_call" => op_svc_call,
         "__svc_call_cancellable" => op_svc_call_cancellable,
         "__base_service_call" => op_base_service_call,
+        "__base_secret_get" => op_base_secret_get,
         "__svc_rpc" => op_svc_rpc,
         "__queue_dispatch" => op_queue_dispatch,
         "__queue_policy" => op_queue_policy,
@@ -7333,6 +7334,35 @@ fn op_base_service_call(
             "bodyBytes": response.body,
         });
         Ok(asyncrt::OpOut::Str(reply.to_string()))
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// `__base_secret_get(binding)` -> Promise<json>. This has no URL, method,
+/// request body, target identity or generic headers. Only a Base-managed
+/// retained realization gets the host context; the callback independently
+/// verifies its source and current Secret Binding before Base decrypts.
+fn op_base_secret_get(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Err(error) = event_context(scope).charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
+    let Some(context) = scope.get_slot::<Arc<BaseWorkloadContext>>().cloned() else {
+        return loader_throw(scope, "Base Secret Bindings are unavailable in this Worker");
+    };
+    let binding = args.get(0).to_rust_string_lossy(scope);
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
+        let value = context.read_secret(binding).await?;
+        let text = String::from_utf8(value)
+            .map_err(|_| "Base Secret Binding value is not valid UTF-8".to_owned())?;
+        Ok(asyncrt::OpOut::Str(
+            serde_json::json!({ "text": text }).to_string(),
+        ))
     });
     rv.set(promise_for(scope, id));
 }

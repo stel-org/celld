@@ -3688,6 +3688,10 @@ const __makeBaseServiceBinding = __celld.__makeBaseServiceBinding =
         name, req.url, req.method, body, JSON.stringify(allowed)));
       return new Response(Uint8Array.from(r.bodyBytes || []), { status: r.status });
     },
+    async get() {
+      const r = JSON.parse(await __base_secret_get(name));
+      return r.text;
+    },
   });
 
 __celld.__installLoaderEnv = (bytes, routes) => {
