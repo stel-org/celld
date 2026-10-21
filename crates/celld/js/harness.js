@@ -3676,7 +3676,67 @@ const __makeServiceBinding = __celld.__makeServiceBinding =
 // requested Base Binding name; it is not a target script, Resource ID, or
 // authority snapshot. The host derives the source realization identity.
 const __makeBaseServiceBinding = __celld.__makeBaseServiceBinding =
-  (name) => ({
+  (name) => {
+    // This codec is deliberately narrow and explicit.  It preserves the
+    // Base V0 values that can safely cross this private callback without
+    // treating a JSON string as a substitute for arbitrary engine state.
+    const base64 = (bytes) => {
+      let text = "";
+      for (const byte of bytes) text += String.fromCharCode(byte);
+      return btoa(text);
+    };
+    const unbase64 = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+    const keyPart = (value) => {
+      if (value instanceof Uint8Array) return { type: "bytes", value: base64(value) };
+      if (typeof value === "string") return { type: "string", value };
+      if (typeof value === "bigint") return { type: "int", value: value.toString() };
+      if (typeof value === "number") return { type: "float", value };
+      if (typeof value === "boolean") return { type: "bool", value };
+      throw new TypeError("Base KV key parts must be strings, numbers, booleans, BigInts, or Uint8Array");
+    };
+    const key = (value) => {
+      if (!Array.isArray(value)) throw new TypeError("Base KV keys must be arrays");
+      return value.map(keyPart);
+    };
+    const value = (item) => {
+      if (item instanceof Uint8Array) return { type: "bytes", value: base64(item) };
+      if (typeof item === "bigint") return { type: "bigInt", value: item.toString() };
+      if (item === null) return { type: "null" };
+      if (typeof item === "boolean") return { type: "bool", value: item };
+      if (typeof item === "number") return { type: "number", value: item };
+      if (typeof item === "string") return { type: "string", value: item };
+      return { type: "json", value: item };
+    };
+    const sqlValue = (item) => {
+      if (item === null) return { type: "null" };
+      if (typeof item === "bigint") return { type: "integer", value: item.toString() };
+      if (typeof item === "number" && Number.isSafeInteger(item)) return { type: "integer", value: String(item) };
+      if (typeof item === "number") return { type: "real", value: item };
+      if (typeof item === "string") return { type: "text", value: item };
+      if (item instanceof Uint8Array) return { type: "blob", value: base64(item) };
+      throw new TypeError("Base SQLite parameters must be null, numbers, BigInts, strings, or Uint8Array");
+    };
+    const sqlResultValue = (item) => {
+      switch (item.type) {
+        case "null": return null;
+        case "integer": return BigInt(item.value);
+        case "real": case "text": return item.value;
+        case "blob": return unbase64(item.value);
+        default: throw new TypeError("Base SQLite result is invalid");
+      }
+    };
+    const kvResultValue = (item) => {
+      switch (item.type) {
+        case "bytes": return unbase64(item.value);
+        case "bigInt": return BigInt(item.value);
+        case "json": return item.value;
+        case "v8": return unbase64(item.value);
+        default: throw new TypeError("Base KV result is invalid");
+      }
+    };
+    const call = async (operation, payload = new Uint8Array()) =>
+      JSON.parse(await __base_data_call(name, JSON.stringify(operation), payload));
+    return {
     async fetch(input, init) {
       const req = new Request(input, init);
       const body = new Uint8Array(await req.arrayBuffer());
@@ -3689,10 +3749,81 @@ const __makeBaseServiceBinding = __celld.__makeBaseServiceBinding =
       return new Response(Uint8Array.from(r.bodyBytes || []), { status: r.status });
     },
     async get() {
-      const r = JSON.parse(await __base_secret_get(name));
-      return r.text;
+      // Argumentless get remains the existing Secret Binding operation. KV
+      // and Object Storage use their explicit category surfaces below so a
+      // JS argument never decides a target Service category.
+      if (arguments.length === 0) {
+        const r = JSON.parse(await __base_secret_get(name));
+        return r.text;
+      }
+      throw new TypeError("Use binding.kv.get() or binding.objects.get() for Base data Services");
     },
-  });
+    kv: {
+      async get(k) {
+        const r = await call({ kind: "kvGet", key: key(k) });
+        if (r.entry === null) return null;
+        return { key: r.entry.key, value: kvResultValue(r.entry.value), versionstamp: r.entry.versionstamp };
+      },
+      async set(k, v, options = {}) {
+        return call({ kind: "kvSet", key: key(k), value: value(v), expireAtMillis: options.expireAtMillis ?? null });
+      },
+      async delete(k) { return call({ kind: "kvDelete", key: key(k) }); },
+      async list(prefix, limit = 100) {
+        const r = await call({ kind: "kvList", prefix: key(prefix), limit });
+        return r.entries.map((entry) => ({ key: entry.key, value: kvResultValue(entry.value), versionstamp: entry.versionstamp }));
+      },
+      async atomic(checks = [], mutations = []) {
+        if (!Array.isArray(checks) || !Array.isArray(mutations))
+          throw new TypeError("Base KV atomic checks and mutations must be arrays");
+        return call({
+          kind: "kvAtomic",
+          checks: checks.map((check) => ({
+            key: key(check.key),
+            versionstamp: check.versionstamp ?? null,
+          })),
+          mutations: mutations.map((mutation) => {
+            if (mutation === null || typeof mutation !== "object")
+              throw new TypeError("Base KV atomic mutations must be objects");
+            const kind = mutation.kind;
+            if (kind !== "set" && kind !== "delete")
+              throw new TypeError("Base KV atomic mutation kind must be set or delete");
+            return {
+              key: key(mutation.key),
+              kind,
+              value: kind === "set" ? value(mutation.value) : null,
+              expireAtMillis: mutation.expireAtMillis ?? null,
+            };
+          }),
+        });
+      },
+    },
+    sql: {
+      async query(sql, parameters = []) {
+        const r = await call({ kind: "sqliteQuery", sql, parameters: parameters.map(sqlValue) });
+        return { columns: r.columns, rows: r.rows.map((row) => row.map(sqlResultValue)) };
+      },
+      async execute(sql, parameters = []) {
+        return call({ kind: "sqliteExecute", sql, parameters: parameters.map(sqlValue) });
+      },
+      async transaction(statements) {
+        return call({ kind: "sqliteTransaction", statements: statements.map((statement) => ({ sql: statement.sql, parameters: (statement.parameters || []).map(sqlValue) })) });
+      },
+    },
+    objects: {
+      async put(key, bytes, options = {}) {
+        if (!(bytes instanceof Uint8Array)) throw new TypeError("Base Object Storage put requires Uint8Array");
+        return call({ kind: "objectPut", key, create: options.create === true }, bytes);
+      },
+      async get(key) {
+        const r = await call({ kind: "objectGet", key });
+        return unbase64(r.bytes);
+      },
+      async head(key) { return call({ kind: "objectHead", key }); },
+      async delete(key) { return call({ kind: "objectDelete", key }); },
+      async list(options = {}) { return call({ kind: "objectList", prefix: options.prefix ?? null, after: options.after ?? null, limit: options.limit ?? 100 }); },
+    },
+  };
+  };
 
 __celld.__installLoaderEnv = (bytes, routes) => {
   const env = __sc_decode(bytes);

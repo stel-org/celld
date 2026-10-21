@@ -6962,6 +6962,7 @@ ops! { OP_NAMES, install_op_functions,
         "__svc_call_cancellable" => op_svc_call_cancellable,
         "__base_service_call" => op_base_service_call,
         "__base_secret_get" => op_base_secret_get,
+        "__base_data_call" => op_base_data_call,
         "__svc_rpc" => op_svc_rpc,
         "__queue_dispatch" => op_queue_dispatch,
         "__queue_policy" => op_queue_policy,
@@ -7363,6 +7364,41 @@ fn op_base_secret_get(
         Ok(asyncrt::OpOut::Str(
             serde_json::json!({ "text": text }).to_string(),
         ))
+    });
+    rv.set(promise_for(scope, id));
+}
+
+/// `__base_data_call(binding, operationJson, payload)` -> Promise<json>.
+/// This is intentionally available only when a retained Base realization has
+/// installed `BaseWorkloadContext`. The host sends no caller-selected Base
+/// identity; the context derives it from trusted realization metadata.
+fn op_base_data_call(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    if let Err(error) = event_context(scope).charge_subrequest() {
+        return loader_throw(scope, &error);
+    }
+    let Some(context) = scope.get_slot::<Arc<BaseWorkloadContext>>().cloned() else {
+        return loader_throw(
+            scope,
+            "Base data Service Bindings are unavailable in this Worker",
+        );
+    };
+    let binding = args.get(0).to_rust_string_lossy(scope);
+    let operation = match serde_json::from_str(&args.get(1).to_rust_string_lossy(scope)) {
+        Ok(operation) => operation,
+        Err(_) => return loader_throw(scope, "Base data Service operation is invalid"),
+    };
+    let Some(payload) = view_bytes(args.get(2)) else {
+        return loader_throw(scope, "Base data Service payload is not a typed array");
+    };
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Service);
+    let id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
+        let reply = context.data_operation(binding, operation, payload).await?;
+        Ok(asyncrt::OpOut::Str(reply.to_string()))
     });
     rv.set(promise_for(scope, id));
 }

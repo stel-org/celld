@@ -184,6 +184,36 @@ string. A Worker receiving a permitted Base Worker call may read its own bound
 Secret; it still cannot initiate another Worker dispatch under the B3.8.6
 one-hop restriction. Ordinary celld Workers retain no Base Secret capability.
 
+## B4.6 verified Base data-Service bridge
+
+Base-retained realizations also expose deliberately typed `env.NAME.kv`,
+`env.NAME.sql`, and `env.NAME.objects` surfaces. They are not celld's inherited
+deployment-local KV, D1, or R2 products. JavaScript provides a Binding name and
+a closed operation only; celld derives the retained Project/Worker/Branch/
+Realization/installation/process context and sends it to the paired private
+`base-workload.sock`.
+
+`dataServiceOperation` v3 has a distinct, domain-separated HMAC binding that
+covers origin metadata, Binding name, serialized operation, payload length and
+SHA-256, plus a fresh nonce. Base remains the authority: it verifies the
+retained origin, replay nonce and current Binding revision, resolves the
+Resource category and operates its own KV, SQLite or Object Storage engine.
+celld does not open Service files, receive a Service ID, choose a filesystem
+path or gain a fallback path when Base refuses an operation.
+
+The callback has an independent bounded admission pool. Metadata and ordinary
+results are bounded; Object uploads are raw authenticated payload bytes, and
+Object downloads are request-bound HMAC frames of at most 256 KiB after a
+sealed descriptor. celld materializes a successful bounded download as a
+`Uint8Array` for the V8 caller. The current local limit is 64 MiB. Base uses a
+distinct pairing-derived AEAD response key, so v3 responses cannot be confused
+with Worker dispatch or Secret-read responses.
+
+Revoking or retargeting a Binding prevents the next operation; operations
+already admitted by Base retain their truthful outcome. This is a private
+retained-Worker capability, not a public control API, Worker-created binding,
+generic database protocol, Gateway feature, or new runtime lifecycle path.
+
 ## B3.2.1 bounded Base Worker invocation
 
 Protocol version 3 adds one separately authenticated operation,
