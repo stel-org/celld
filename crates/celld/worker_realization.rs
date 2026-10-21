@@ -130,6 +130,8 @@ impl WorkerRealizationRegistry {
         metadata: &RealizationMetadata,
         url: String,
         method: String,
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
     ) -> Result<HttpResponse, InvokeError> {
         let Some(entry) = self.entry(&metadata.realization_id) else {
             return Err(InvokeError::Absent);
@@ -148,7 +150,7 @@ impl WorkerRealizationRegistry {
         }
         let result = entry
             .runtime
-            .fetch(url, method, RequestBody::from(Vec::new()), Vec::new(), None)
+            .fetch(url, method, RequestBody::from(body), headers, None)
             .await
             .map_err(InvokeError::Runtime);
         self.release(&metadata.realization_id, &entry);

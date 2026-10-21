@@ -52,10 +52,16 @@ const WORKER_EXECUTION_PROTOCOL_VERSION: u32 = 3;
 /// the pre-existing, one-off stateless execution operation.
 const WORKER_REALIZATION_PROTOCOL_VERSION_V4: u32 = 4;
 const WORKER_REALIZATION_PROTOCOL_VERSION_V5: u32 = 5;
+/// Bounded request delivery to an already retained realization. v4 and v5
+/// remain historical lifecycle protocols and are never reinterpreted.
+const WORKER_REALIZATION_PROTOCOL_VERSION_V6: u32 = 6;
 const BASE_WORKER_PROFILE_CONTRACT: &str = "base-worker/celld-base-worker-esm-v1";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_WORKER_ARTIFACT_BYTES: usize = 512 * 1024;
 const MAX_WORKER_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_WORKER_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_WORKER_REQUEST_PATH_BYTES: usize = 2_048;
+const MAX_WORKER_CONTENT_TYPE_BYTES: usize = 256;
 const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const EXECUTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,7 +135,7 @@ struct WorkerExecutionRequest {
     proof: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkerRealizationRequest {
     operation: String,
@@ -144,6 +150,14 @@ struct WorkerRealizationRequest {
     artifact_bytes: Option<usize>,
     url: Option<String>,
     method: Option<String>,
+    #[serde(default)]
+    path_and_query: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    body_bytes: Option<usize>,
+    #[serde(default)]
+    body_sha256: Option<String>,
     #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
@@ -603,6 +617,7 @@ async fn handle_execution(
         Some(
             "establishWorkerRealization"
                 | "invokeWorkerRealization"
+                | "dispatchWorkerRealization"
                 | "inspectWorkerRealization"
                 | "retireWorkerRealization"
         )
@@ -887,6 +902,7 @@ async fn handle_worker_realization(
         request.operation.as_str(),
         "establishWorkerRealization"
             | "invokeWorkerRealization"
+            | "dispatchWorkerRealization"
             | "inspectWorkerRealization"
             | "retireWorkerRealization"
     );
@@ -911,17 +927,40 @@ async fn handle_worker_realization(
                 })
                 && request.method.as_deref() == Some("GET")
         }
+        "dispatchWorkerRealization" => {
+            request.artifact_bytes.is_none()
+                && request.url.is_none()
+                && request.method.as_deref().is_some_and(valid_internal_method)
+                && request
+                    .path_and_query
+                    .as_deref()
+                    .is_some_and(valid_internal_path)
+                && request
+                    .content_type
+                    .as_deref()
+                    .is_none_or(valid_content_type)
+                && request
+                    .body_bytes
+                    .is_some_and(|bytes| bytes <= MAX_WORKER_REQUEST_BODY_BYTES)
+                && request.body_sha256.as_deref().is_some_and(valid_digest)
+        }
         "inspectWorkerRealization" | "retireWorkerRealization" => {
             request.artifact_bytes.is_none() && request.url.is_none() && request.method.is_none()
         }
         _ => false,
     };
-    if !supported
-        || request.protocol != PROTOCOL
-        || !matches!(
+    let protocol_shape = match request.operation.as_str() {
+        "dispatchWorkerRealization" => {
+            request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V6
+        }
+        _ => matches!(
             request.protocol_version,
             WORKER_REALIZATION_PROTOCOL_VERSION_V4 | WORKER_REALIZATION_PROTOCOL_VERSION_V5
-        )
+        ),
+    };
+    if !supported
+        || request.protocol != PROTOCOL
+        || !protocol_shape
         || !identities_valid
         || !valid_digest(&request.artifact_sha256)
         || !artifact_shape
@@ -1054,6 +1093,8 @@ async fn handle_worker_realization(
                 &metadata,
                 request.url.clone().expect("validated URL"),
                 request.method.clone().expect("validated method"),
+                Vec::new(),
+                Vec::new(),
             )
             .await
             .and_then(|response| {
@@ -1067,6 +1108,55 @@ async fn handle_worker_realization(
                 ("refused", None, None)
             }
         },
+        "dispatchWorkerRealization" => {
+            let body_bytes = request.body_bytes.expect("validated body length");
+            let mut body = vec![0_u8; body_bytes];
+            if !matches!(
+                tokio::time::timeout(WORKER_EXECUTION_TIMEOUT, stream.read_exact(&mut body)).await,
+                Ok(Ok(_))
+            ) || hex::encode(Sha256::digest(&body))
+                != request.body_sha256.as_deref().unwrap_or("")
+            {
+                return write_json(
+                    &mut stream,
+                    &Rejection {
+                        error: "authentication_rejected",
+                    },
+                )
+                .await;
+            }
+            let headers = request
+                .content_type
+                .as_ref()
+                .map_or_else(Vec::new, |value| {
+                    vec![("content-type".to_owned(), value.clone())]
+                });
+            let url = format!(
+                "https://base.local{}",
+                request.path_and_query.as_deref().expect("validated path")
+            );
+            match realizations
+                .invoke(
+                    &metadata,
+                    url,
+                    request.method.clone().expect("validated method"),
+                    body,
+                    headers,
+                )
+                .await
+                .and_then(|response| {
+                    bounded_response(response, MAX_WORKER_RESPONSE_BYTES)
+                        .map_err(InvokeError::Runtime)
+                }) {
+                Ok(response) => ("accepting", Some(response.status), Some(response.body)),
+                Err(InvokeError::Absent) => ("absent", None, None),
+                Err(InvokeError::Retiring) => ("retiring", None, None),
+                Err(InvokeError::Runtime(error)) => {
+                    tracing::warn!(%error, "Base Worker realization bounded dispatch refused");
+                    ("refused", None, None)
+                }
+            }
+        }
         "inspectWorkerRealization" => match realizations.inspect(&request.realization_id) {
             Some((actual, LocalPresence::Accepting)) if actual == metadata => {
                 ("accepting", None, None)
@@ -1107,7 +1197,17 @@ fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRunti
     ) {
         (WORKER_REALIZATION_PROTOCOL_VERSION_V4, None, None) => Some(WorkerRuntimeProfile::Default),
         (
+            WORKER_REALIZATION_PROTOCOL_VERSION_V6,
+            Some("default"),
+            Some("base-worker/celld-browser-esm-v1"),
+        ) => Some(WorkerRuntimeProfile::Default),
+        (
             WORKER_REALIZATION_PROTOCOL_VERSION_V5,
+            Some("base-worker"),
+            Some(BASE_WORKER_PROFILE_CONTRACT),
+        ) => Some(WorkerRuntimeProfile::BaseWorker),
+        (
+            WORKER_REALIZATION_PROTOCOL_VERSION_V6,
             Some("base-worker"),
             Some(BASE_WORKER_PROFILE_CONTRACT),
         ) => Some(WorkerRuntimeProfile::BaseWorker),
@@ -1407,6 +1507,32 @@ fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_internal_method(value: &str) -> bool {
+    matches!(value, "GET" | "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+fn valid_internal_path(value: &str) -> bool {
+    let path = value.split_once('?').map_or(value, |(path, _)| path);
+    !value.is_empty()
+        && value.len() <= MAX_WORKER_REQUEST_PATH_BYTES
+        && value.starts_with('/')
+        && !value.starts_with("//")
+        && !value.contains('#')
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b'\\')
+        && !path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+        && !value.to_ascii_lowercase().contains("%2e")
+}
+
+fn valid_content_type(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_WORKER_CONTENT_TYPE_BYTES
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
 fn request_material(nonce: &str) -> String {
     format!("request:{PROTOCOL}:{PROTOCOL_VERSION}:{nonce}")
 }
@@ -1471,6 +1597,32 @@ fn worker_execution_response_material(
 }
 
 fn worker_realization_request_material(request: &WorkerRealizationRequest) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V6 {
+        return canonical_material(
+            "dispatch-worker-realization-request-v6",
+            &[
+                &request.protocol,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                request.method.as_deref().unwrap_or(""),
+                request.path_and_query.as_deref().unwrap_or(""),
+                request.content_type.as_deref().unwrap_or(""),
+                &request
+                    .body_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.body_sha256.as_deref().unwrap_or(""),
+                &request.nonce,
+            ],
+        );
+    }
     let legacy = format!(
         "worker-realization:{PROTOCOL}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         request.protocol_version,
@@ -1513,6 +1665,40 @@ fn worker_realization_response_material(
     body_sha256: Option<String>,
     body_bytes: Option<usize>,
 ) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V6 {
+        return canonical_material(
+            "dispatch-worker-realization-response-v6",
+            &[
+                PROTOCOL,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                installation_id,
+                "celld",
+                implementation_version,
+                process_instance_id,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                request.method.as_deref().unwrap_or(""),
+                request.path_and_query.as_deref().unwrap_or(""),
+                request.content_type.as_deref().unwrap_or(""),
+                &request
+                    .body_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.body_sha256.as_deref().unwrap_or(""),
+                local_presence,
+                &status.map_or_else(String::new, |value| value.to_string()),
+                body_sha256.as_deref().unwrap_or(""),
+                &body_bytes.map_or_else(String::new, |value| value.to_string()),
+                &request.nonce,
+            ],
+        );
+    }
     let legacy = format!(
         "worker-realization-response:{PROTOCOL}:{}:{}:{installation_id}:celld:{implementation_version}:{process_instance_id}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         request.protocol_version,
@@ -1537,6 +1723,17 @@ fn worker_realization_response_material(
         request.profile.as_deref().unwrap_or(""),
         request.execution_contract.as_deref().unwrap_or("")
     )
+}
+
+fn canonical_material(label: &str, fields: &[&str]) -> String {
+    let mut material = String::from(label);
+    for value in fields {
+        material.push(':');
+        material.push_str(&value.len().to_string());
+        material.push(':');
+        material.push_str(value);
+    }
+    material
 }
 
 #[allow(
@@ -1712,6 +1909,10 @@ mod tests {
             artifact_bytes: Some(12),
             url: None,
             method: None,
+            path_and_query: None,
+            content_type: None,
+            body_bytes: None,
+            body_sha256: None,
             profile: Some("base-worker".to_owned()),
             execution_contract: Some(BASE_WORKER_PROFILE_CONTRACT.to_owned()),
             nonce: "0123456789abcdef0123456789abcdef".to_owned(),
@@ -1744,6 +1945,45 @@ mod tests {
             &worker_realization_request_material(&changed),
             &proof
         ));
+    }
+
+    #[test]
+    fn dispatch_v6_proof_binds_request_shape_and_body_digest() {
+        let secret = [9_u8; 32];
+        let mut request = profile_request();
+        request.operation = "dispatchWorkerRealization".to_owned();
+        request.protocol_version = WORKER_REALIZATION_PROTOCOL_VERSION_V6;
+        request.profile = Some("default".to_owned());
+        request.execution_contract = Some("base-worker/celld-browser-esm-v1".to_owned());
+        request.artifact_bytes = None;
+        request.method = Some("POST".to_owned());
+        request.path_and_query = Some("/bounded?one=1".to_owned());
+        request.content_type = Some("application/json".to_owned());
+        request.body_bytes = Some(2);
+        request.body_sha256 = Some(hex::encode(Sha256::digest(b"{}")));
+        let proof = sign(&secret, &worker_realization_request_material(&request));
+        assert!(verify(
+            &secret,
+            &worker_realization_request_material(&request),
+            &proof
+        ));
+        for mutate in [0, 1, 2, 3] {
+            let mut changed = request.clone();
+            match mutate {
+                0 => changed.method = Some("PUT".to_owned()),
+                1 => changed.path_and_query = Some("/other".to_owned()),
+                2 => changed.content_type = Some("text/plain".to_owned()),
+                _ => changed.body_sha256 = Some("a".repeat(64)),
+            }
+            assert!(!verify(
+                &secret,
+                &worker_realization_request_material(&changed),
+                &proof
+            ));
+        }
+        assert!(valid_internal_path("/valid/path?x=%2F"));
+        assert!(!valid_internal_path("//host/path"));
+        assert!(!valid_internal_path("/a/../b"));
     }
 
     #[test]
