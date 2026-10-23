@@ -193,7 +193,26 @@ JSON `Content-Type`, `Location`, two independent `Set-Cookie` fields and a
 JSON body. The test verifies the complete response HMAC material. Base's
 isolated `prove-worker-realization.sh` process proof additionally starts this
 celld binary with a temporary pairing directory, establishes a Worker through
-the Base Worker compiler, and completes that v7 request through Base Runtime.
+the Base Worker compiler, and completes the separately versioned public v8
+request through Base Runtime.
+
+## R8.3-A public HTTP URL delivery
+
+`dispatchWorkerRealization` v8 is the authenticated public-request successor to
+v7. Capability discovery advertises both `[7, 8]`; v7 remains the existing
+internal delivery contract. v8 adds a required `requestUrl` to the signed
+request and response material (`dispatch-worker-realization-request-v8` and
+`dispatch-worker-realization-response-v8`). celld accepts only an `http` URL
+whose authority is syntactically safe and whose exact path/query equals the
+already signed request target. It passes that URL unchanged to the retained
+registry and existing `StatelessRuntime`.
+
+The URL describes a request Base already authorized through its Gateway; it
+does not select a realization, Worker, artifact or execution contract. celld
+does not inspect forwarding headers or implement TLS/HTTPS. A v8 response keeps
+the v7 status/header/body semantics, including repeated headers. If a public
+request needs v8 but the paired receiver does not prove it, Base rejects rather
+than silently substituting the v7 internal `https://base.local` URL.
 
 ## B3.8.6 verified Base Workload Binding bridge
 

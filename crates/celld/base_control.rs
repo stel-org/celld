@@ -60,6 +60,9 @@ const WORKER_REALIZATION_PROTOCOL_VERSION_V6: u32 = 6;
 /// Authenticated buffered HTTP delivery. It is advertised only by the explicit
 /// capability operation below once this receiver is present.
 const WORKER_REALIZATION_PROTOCOL_VERSION_V7: u32 = 7;
+/// Public HTTP URL delivery. v7 remains available for internal requests whose
+/// established origin is intentionally private.
+const WORKER_REALIZATION_PROTOCOL_VERSION_V8: u32 = 8;
 const BASE_WORKER_PROFILE_CONTRACT: &str = "base-worker/celld-base-worker-esm-v1";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_HTTP_DELIVERY_MESSAGE_BYTES: usize = 128 * 1024;
@@ -164,6 +167,8 @@ struct WorkerRealizationRequest {
     #[serde(default)]
     path_and_query: Option<String>,
     #[serde(default)]
+    request_url: Option<String>,
+    #[serde(default)]
     content_type: Option<String>,
     #[serde(default)]
     headers: Option<Vec<HttpHeaderFrame>>,
@@ -205,7 +210,7 @@ struct DeliveryCapabilityResponse<'a> {
     installation_id: &'a str,
     implementation: &'static str,
     implementation_version: &'static str,
-    supported_versions: [u32; 1],
+    supported_versions: [u32; 2],
     nonce: &'a str,
     proof: String,
 }
@@ -900,7 +905,10 @@ async fn handle_http_delivery_capability(
         )
         .await;
     }
-    let supported_versions = [WORKER_REALIZATION_PROTOCOL_VERSION_V7];
+    let supported_versions = [
+        WORKER_REALIZATION_PROTOCOL_VERSION_V7,
+        WORKER_REALIZATION_PROTOCOL_VERSION_V8,
+    ];
     let versions = supported_versions
         .iter()
         .map(u32::to_string)
@@ -1086,10 +1094,22 @@ async fn handle_worker_realization(
             if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
                 common
                     && request.content_type.is_none()
+                    && request.request_url.is_none()
+                    && request.headers.as_deref().is_some_and(valid_http_headers)
+            } else if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V8 {
+                common
+                    && request.content_type.is_none()
+                    && request.request_url.as_deref().is_some_and(|url| {
+                        valid_public_http_url(
+                            url,
+                            request.path_and_query.as_deref().expect("validated path"),
+                        )
+                    })
                     && request.headers.as_deref().is_some_and(valid_http_headers)
             } else {
                 common
                     && request.headers.is_none()
+                    && request.request_url.is_none()
                     && request
                         .content_type
                         .as_deref()
@@ -1109,7 +1129,9 @@ async fn handle_worker_realization(
         "dispatchWorkerRealization" => {
             matches!(
                 request.protocol_version,
-                WORKER_REALIZATION_PROTOCOL_VERSION_V6 | WORKER_REALIZATION_PROTOCOL_VERSION_V7
+                WORKER_REALIZATION_PROTOCOL_VERSION_V6
+                    | WORKER_REALIZATION_PROTOCOL_VERSION_V7
+                    | WORKER_REALIZATION_PROTOCOL_VERSION_V8
             )
         }
         _ => matches!(
@@ -1120,9 +1142,9 @@ async fn handle_worker_realization(
     if !supported
         || request.protocol != PROTOCOL
         || !protocol_shape
-        || (request.protocol_version != WORKER_REALIZATION_PROTOCOL_VERSION_V7
+        || (request.protocol_version < WORKER_REALIZATION_PROTOCOL_VERSION_V7
             && frame_bytes > MAX_MESSAGE_BYTES)
-        || (request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7
+        || (request.protocol_version >= WORKER_REALIZATION_PROTOCOL_VERSION_V7
             && frame_bytes > MAX_HTTP_DELIVERY_MESSAGE_BYTES)
         || !identities_valid
         || !valid_digest(&request.artifact_sha256)
@@ -1300,7 +1322,7 @@ async fn handle_worker_realization(
                 )
                 .await;
             }
-            let headers = if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
+            let headers = if request.protocol_version >= WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
                 match decode_execution_headers(
                     request.headers.as_deref().expect("validated headers"),
                 ) {
@@ -1323,10 +1345,16 @@ async fn handle_worker_realization(
                         vec![("content-type".to_owned(), value.clone())]
                     })
             };
-            let url = format!(
-                "https://base.local{}",
-                request.path_and_query.as_deref().expect("validated path")
-            );
+            let url = if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V8 {
+                request.request_url.clone().expect("validated public URL")
+            } else {
+                // v7 is the established internal-delivery contract. It is not
+                // reinterpreted as a public HTTP origin.
+                format!(
+                    "https://base.local{}",
+                    request.path_and_query.as_deref().expect("validated path")
+                )
+            };
             match realizations
                 .invoke(
                     &metadata,
@@ -1342,7 +1370,7 @@ async fn handle_worker_realization(
                 }) {
                 Ok(response) => {
                     let headers = (request.protocol_version
-                        == WORKER_REALIZATION_PROTOCOL_VERSION_V7)
+                        >= WORKER_REALIZATION_PROTOCOL_VERSION_V7)
                         .then(|| encode_response_headers(&response.headers));
                     if !(100..=599).contains(&response.status)
                         || headers
@@ -1411,7 +1439,9 @@ fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRunti
     ) {
         (WORKER_REALIZATION_PROTOCOL_VERSION_V4, None, None) => Some(WorkerRuntimeProfile::Default),
         (
-            WORKER_REALIZATION_PROTOCOL_VERSION_V6 | WORKER_REALIZATION_PROTOCOL_VERSION_V7,
+            WORKER_REALIZATION_PROTOCOL_VERSION_V6
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V7
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V8,
             Some("default"),
             Some("base-worker/celld-browser-esm-v1"),
         ) => Some(WorkerRuntimeProfile::Default),
@@ -1421,7 +1451,9 @@ fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRunti
             Some(BASE_WORKER_PROFILE_CONTRACT),
         ) => Some(WorkerRuntimeProfile::BaseWorker),
         (
-            WORKER_REALIZATION_PROTOCOL_VERSION_V6 | WORKER_REALIZATION_PROTOCOL_VERSION_V7,
+            WORKER_REALIZATION_PROTOCOL_VERSION_V6
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V7
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V8,
             Some("base-worker"),
             Some(BASE_WORKER_PROFILE_CONTRACT),
         ) => Some(WorkerRuntimeProfile::BaseWorker),
@@ -1444,7 +1476,7 @@ async fn write_worker_realization_response(
     body: Option<Vec<u8>>,
     headers: Option<Vec<HttpHeaderFrame>>,
 ) -> anyhow::Result<()> {
-    let headers = if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
+    let headers = if request.protocol_version >= WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
         Some(headers.unwrap_or_default())
     } else {
         headers
@@ -1859,6 +1891,30 @@ fn valid_internal_path(value: &str) -> bool {
         && !value.to_ascii_lowercase().contains("%2e")
 }
 
+fn valid_public_http_url(url: &str, path_and_query: &str) -> bool {
+    let Some(authority) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((authority, path)) = authority.split_once('/') else {
+        return false;
+    };
+    if format!("/{path}") != path_and_query || authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let (hostname, port) = authority
+        .rsplit_once(':')
+        .map_or((authority, 80_u16), |(name, port)| {
+            (name, port.parse::<u16>().unwrap_or(0))
+        });
+    port != 0
+        && !hostname.is_empty()
+        && hostname.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.'
+        })
+        && !hostname.starts_with('.')
+        && !hostname.ends_with('.')
+}
+
 fn valid_content_type(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_WORKER_CONTENT_TYPE_BYTES
@@ -1929,6 +1985,34 @@ fn worker_execution_response_material(
 }
 
 fn worker_realization_request_material(request: &WorkerRealizationRequest) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V8 {
+        let headers = header_material(request.headers.as_deref().unwrap_or_default());
+        return canonical_material(
+            "dispatch-worker-realization-request-v8",
+            &[
+                &request.protocol,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                request.method.as_deref().unwrap_or(""),
+                request.path_and_query.as_deref().unwrap_or(""),
+                request.request_url.as_deref().unwrap_or(""),
+                &headers,
+                &request
+                    .body_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.body_sha256.as_deref().unwrap_or(""),
+                &request.nonce,
+            ],
+        );
+    }
     if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
         let headers = header_material(request.headers.as_deref().unwrap_or_default());
         return canonical_material(
@@ -2025,6 +2109,44 @@ fn worker_realization_response_material(
     body_sha256: Option<String>,
     body_bytes: Option<usize>,
 ) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V8 {
+        let request_headers = header_material(request.headers.as_deref().unwrap_or_default());
+        let response_headers = header_material(headers);
+        return canonical_material(
+            "dispatch-worker-realization-response-v8",
+            &[
+                PROTOCOL,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                installation_id,
+                "celld",
+                implementation_version,
+                process_instance_id,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                request.method.as_deref().unwrap_or(""),
+                request.path_and_query.as_deref().unwrap_or(""),
+                request.request_url.as_deref().unwrap_or(""),
+                &request_headers,
+                &request
+                    .body_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.body_sha256.as_deref().unwrap_or(""),
+                local_presence,
+                &status.map_or_else(String::new, |value| value.to_string()),
+                &response_headers,
+                body_sha256.as_deref().unwrap_or(""),
+                &body_bytes.map_or_else(String::new, |value| value.to_string()),
+                &request.nonce,
+            ],
+        );
+    }
     if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
         let request_headers = header_material(request.headers.as_deref().unwrap_or_default());
         let response_headers = header_material(headers);
@@ -2317,6 +2439,7 @@ mod tests {
             url: None,
             method: None,
             path_and_query: None,
+            request_url: None,
             content_type: None,
             headers: None,
             body_bytes: None,
@@ -2474,6 +2597,26 @@ mod tests {
         }];
         assert!(valid_http_headers(&non_utf8));
         assert!(decode_execution_headers(&non_utf8).is_err());
+
+        let mut public = request.clone();
+        public.protocol_version = WORKER_REALIZATION_PROTOCOL_VERSION_V8;
+        public.request_url = Some("http://webshop.base:8080/api/orders?source=web".to_owned());
+        let public_proof = sign(&secret, &worker_realization_request_material(&public));
+        assert!(verify(
+            &secret,
+            &worker_realization_request_material(&public),
+            &public_proof
+        ));
+        public.request_url = Some("http://admin.base:8080/api/orders?source=web".to_owned());
+        assert!(!verify(
+            &secret,
+            &worker_realization_request_material(&public),
+            &public_proof
+        ));
+        assert!(!valid_public_http_url(
+            "https://webshop.base/api/orders?source=web",
+            "/api/orders?source=web"
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2513,7 +2656,7 @@ mod tests {
         let response: serde_json::Value =
             serde_json::from_slice(response.strip_suffix(b"\n").expect("newline"))
                 .expect("response JSON");
-        assert_eq!(response["supportedVersions"], serde_json::json!([7]));
+        assert_eq!(response["supportedVersions"], serde_json::json!([7, 8]));
         assert!(verify(
             &secret,
             &canonical_material(
@@ -2525,7 +2668,7 @@ mod tests {
                     response["installationId"].as_str().expect("installation"),
                     "celld",
                     response["implementationVersion"].as_str().expect("version"),
-                    "7",
+                    "7,8",
                     &nonce,
                 ],
             ),
