@@ -214,6 +214,46 @@ the v7 status/header/body semantics, including repeated headers. If a public
 request needs v8 but the paired receiver does not prove it, Base rejects rather
 than silently substituting the v7 internal `https://base.local` URL.
 
+## R8.5-B configuration-capable establishment
+
+`establishWorkerRealization` v9 is the authenticated variable-bearing
+successor to v4/v5 establishment. It does not change HTTP dispatch (v6/v7/v8
+are untouched): v9 carries an explicitly selected, ordinary-variable payload
+bound to one retained realization. Base first sends a non-executing
+`inspectWorkerConfigurationEstablishment` v9 capability request, proved over
+protocol, version, operation and nonce under
+`worker-realization-configuration-capability-request-v9`. celld answers only
+if it implements the contract, with installation, implementation/version,
+`[9]` and the nonce under
+`worker-realization-configuration-capability-response-v9`. Any other
+well-formed unknown operation — including this probe on an older receiver —
+is answered with an explicit unsigned `unsupported_operation` rejection, so
+Base capability checks have a dependable older-peer signal; malformed frames
+still close silently.
+
+The v9 establish frame carries the existing realization identities plus the
+selected Worker Version id, the Version configuration digest, and the
+variable-payload length and SHA-256, all in signed
+`establish-worker-realization-request-v9` material. The immutable artifact
+bytes follow, then exactly the declared payload bytes. celld reads both in
+full, verifies both SHA-256 digests, then validates the payload as canonical
+`[[name, value]]` JSON: strictly ascending names (which rejects duplicates),
+the same name/value bounds Base enforces on immutable Version configuration
+(128 pairs, 128 B names, 8 KiB values, 64 KiB total), and byte-equality with
+its own canonical re-serialization. Truncation, digest mismatch, or any
+structural defect fails the establishment before any Worker starts — never
+as a partial environment — and nothing about the payload contents is logged.
+
+Validated pairs become `WorkerConfigOptions.vars` for exactly the retained
+realization being established; the JS bootstrap installs them onto that
+Worker's `env` object. v9 admits the established profile/contract pairs
+only (default target exactly as its v4 predecessor; BaseWorker contract as
+v5+), so configuration transport never selects a bootstrap. The signed v9
+response echoes the accepted configuration digest under
+`establish-worker-realization-response-v9`; a missing or mismatched echo
+must fail the Base caller closed. v9 frames carrying v4/v5-incompatible
+fields (and vice versa) are rejected rather than reinterpreted.
+
 ## B3.8.6 verified Base Workload Binding bridge
 
 Base-managed retained realizations receive a celld host capability distinct

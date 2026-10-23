@@ -63,6 +63,16 @@ const WORKER_REALIZATION_PROTOCOL_VERSION_V7: u32 = 7;
 /// Public HTTP URL delivery. v7 remains available for internal requests whose
 /// established origin is intentionally private.
 const WORKER_REALIZATION_PROTOCOL_VERSION_V8: u32 = 8;
+/// Configuration-capable establishment. v9 carries an explicitly selected,
+/// authenticated ordinary-variable payload after the immutable artifact bytes.
+/// v8 remains the HTTP dispatch contract and is untouched by this change.
+const WORKER_REALIZATION_PROTOCOL_VERSION_V9: u32 = 9;
+/// Maximum canonical variable payload bytes accepted on v9 establishment.
+/// Matches Base's selected-configuration transport bound.
+const MAX_VARIABLE_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_VARIABLE_COUNT: usize = 128;
+const MAX_VARIABLE_NAME_BYTES: usize = 128;
+const MAX_VARIABLE_VALUE_BYTES: usize = 8 * 1024;
 const BASE_WORKER_PROFILE_CONTRACT: &str = "base-worker/celld-base-worker-esm-v1";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 const MAX_HTTP_DELIVERY_MESSAGE_BYTES: usize = 128 * 1024;
@@ -180,6 +190,18 @@ struct WorkerRealizationRequest {
     profile: Option<String>,
     #[serde(default)]
     execution_contract: Option<String>,
+    /// v9 only: the selected Worker Version authorizing the variable payload.
+    #[serde(default)]
+    version_id: Option<String>,
+    /// v9 only: the selected Version configuration digest, echoed on accept.
+    #[serde(default)]
+    configuration_digest: Option<String>,
+    /// v9 only: canonical variable payload length following the artifact bytes.
+    #[serde(default)]
+    variable_payload_bytes: Option<usize>,
+    /// v9 only: SHA-256 of the canonical variable payload.
+    #[serde(default)]
+    variable_payload_sha256: Option<String>,
     nonce: String,
     proof: String,
 }
@@ -211,6 +233,30 @@ struct DeliveryCapabilityResponse<'a> {
     implementation: &'static str,
     implementation_version: &'static str,
     supported_versions: [u32; 2],
+    nonce: &'a str,
+    proof: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfigurationCapabilityRequest {
+    operation: String,
+    protocol: String,
+    protocol_version: u32,
+    nonce: String,
+    proof: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigurationCapabilityResponse<'a> {
+    operation: &'static str,
+    protocol: &'static str,
+    protocol_version: u32,
+    installation_id: &'a str,
+    implementation: &'static str,
+    implementation_version: &'static str,
+    supported_versions: [u32; 1],
     nonce: &'a str,
     proof: String,
 }
@@ -290,6 +336,10 @@ struct WorkerRealizationResponse<'a> {
     branch_id: &'a str,
     cell_id: &'a str,
     artifact_sha256: &'a str,
+    /// v9 only: the selected configuration digest celld accepted. Absent on
+    /// legacy protocols; callers must not interpret a missing echo as consent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    configuration_digest: Option<&'a str>,
     local_presence: &'a str,
     status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -676,6 +726,15 @@ async fn handle_execution(
         };
         return handle_http_delivery_capability(stream, installation_id, secret, request).await;
     }
+    if value.get("operation").and_then(serde_json::Value::as_str)
+        == Some("inspectWorkerConfigurationEstablishment")
+    {
+        let request: ConfigurationCapabilityRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(_) => return Ok(()),
+        };
+        return handle_configuration_capability(stream, installation_id, secret, request).await;
+    }
     if value.get("operation").and_then(serde_json::Value::as_str) == Some("executeWorker") {
         let request: WorkerExecutionRequest = match serde_json::from_value(value) {
             Ok(request) => request,
@@ -710,6 +769,37 @@ async fn handle_execution(
             frame_bytes,
         )
         .await;
+    }
+    // A well-formed frame naming an operation this peer does not implement is
+    // an explicit unsupported signal, never silent. Base capability probes
+    // treat exactly this unsigned rejection as proof of an older peer; every
+    // other malformed frame still closes silently. The rejection carries no
+    // authority and reveals nothing beyond the operation name the caller
+    // already chose.
+    if let Some(operation) = value.get("operation").and_then(serde_json::Value::as_str) {
+        let known = matches!(
+            operation,
+            "executeDiagnostic"
+                | "evictDiagnostic"
+                | "inspectDiagnostic"
+                | "executeWorker"
+                | "inspectWorkerHttpDelivery"
+                | "inspectWorkerConfigurationEstablishment"
+                | "establishWorkerRealization"
+                | "invokeWorkerRealization"
+                | "dispatchWorkerRealization"
+                | "inspectWorkerRealization"
+                | "retireWorkerRealization"
+        );
+        if !known {
+            return write_json(
+                &mut stream,
+                &Rejection {
+                    error: "unsupported_operation",
+                },
+            )
+            .await;
+        }
     }
     let request: ExecutionRequest = match serde_json::from_value(value) {
         Ok(request) => request,
@@ -943,6 +1033,78 @@ async fn handle_http_delivery_capability(
     write_json(&mut stream, &response).await
 }
 
+/// Authenticated capability probe for v9 configuration-capable
+/// establishment. Advertising v9 is an explicit, signed statement that this
+/// peer validates and applies the selected variable payload before a Worker
+/// becomes accepting. Older peers reject the unknown operation, which Base
+/// treats as an explicit unavailable signal rather than a downgrade permit.
+async fn handle_configuration_capability(
+    mut stream: UnixStream,
+    installation_id: &str,
+    secret: &[u8],
+    request: ConfigurationCapabilityRequest,
+) -> anyhow::Result<()> {
+    if request.operation != "inspectWorkerConfigurationEstablishment"
+        || request.protocol != PROTOCOL
+        || request.protocol_version != WORKER_REALIZATION_PROTOCOL_VERSION_V9
+        || !valid_nonce(&request.nonce)
+        || !verify(
+            secret,
+            &canonical_material(
+                "worker-realization-configuration-capability-request-v9",
+                &[
+                    PROTOCOL,
+                    &WORKER_REALIZATION_PROTOCOL_VERSION_V9.to_string(),
+                    "inspectWorkerConfigurationEstablishment",
+                    &request.nonce,
+                ],
+            ),
+            &request.proof,
+        )
+    {
+        return write_json(
+            &mut stream,
+            &Rejection {
+                error: "authentication_rejected",
+            },
+        )
+        .await;
+    }
+    let supported_versions = [WORKER_REALIZATION_PROTOCOL_VERSION_V9];
+    let versions = supported_versions
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let response = ConfigurationCapabilityResponse {
+        operation: "inspectWorkerConfigurationEstablishment",
+        protocol: PROTOCOL,
+        protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION_V9,
+        installation_id,
+        implementation: "celld",
+        implementation_version: env!("CARGO_PKG_VERSION"),
+        supported_versions,
+        nonce: &request.nonce,
+        proof: sign(
+            secret,
+            &canonical_material(
+                "worker-realization-configuration-capability-response-v9",
+                &[
+                    PROTOCOL,
+                    &WORKER_REALIZATION_PROTOCOL_VERSION_V9.to_string(),
+                    "inspectWorkerConfigurationEstablishment",
+                    installation_id,
+                    "celld",
+                    env!("CARGO_PKG_VERSION"),
+                    &versions,
+                    &request.nonce,
+                ],
+            ),
+        ),
+    };
+    write_json(&mut stream, &response).await
+}
+
 async fn execute_worker_artifact(
     stream: &mut UnixStream,
     installation_id: &str,
@@ -1134,17 +1296,51 @@ async fn handle_worker_realization(
                     | WORKER_REALIZATION_PROTOCOL_VERSION_V8
             )
         }
+        "establishWorkerRealization" => {
+            matches!(
+                request.protocol_version,
+                WORKER_REALIZATION_PROTOCOL_VERSION_V4
+                    | WORKER_REALIZATION_PROTOCOL_VERSION_V5
+                    | WORKER_REALIZATION_PROTOCOL_VERSION_V9
+            )
+        }
         _ => matches!(
             request.protocol_version,
             WORKER_REALIZATION_PROTOCOL_VERSION_V4 | WORKER_REALIZATION_PROTOCOL_VERSION_V5
         ),
     };
+    // v9 configuration fields are part of the signed establishment contract.
+    // A legacy frame carrying them is ambiguous and must fail closed rather
+    // than be reinterpreted as variable-bearing.
+    let variable_shape = if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V9 {
+        request.version_id.as_deref().is_some_and(valid_cell_id)
+            && request
+                .configuration_digest
+                .as_deref()
+                .is_some_and(valid_digest)
+            && request
+                .variable_payload_bytes
+                .is_some_and(|bytes| bytes <= MAX_VARIABLE_PAYLOAD_BYTES)
+            && request
+                .variable_payload_sha256
+                .as_deref()
+                .is_some_and(valid_digest)
+    } else {
+        request.version_id.is_none()
+            && request.configuration_digest.is_none()
+            && request.variable_payload_bytes.is_none()
+            && request.variable_payload_sha256.is_none()
+    };
     if !supported
         || request.protocol != PROTOCOL
         || !protocol_shape
+        || !variable_shape
         || (request.protocol_version < WORKER_REALIZATION_PROTOCOL_VERSION_V7
             && frame_bytes > MAX_MESSAGE_BYTES)
+        || (request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V9
+            && frame_bytes > MAX_MESSAGE_BYTES)
         || (request.protocol_version >= WORKER_REALIZATION_PROTOCOL_VERSION_V7
+            && request.protocol_version != WORKER_REALIZATION_PROTOCOL_VERSION_V9
             && frame_bytes > MAX_HTTP_DELIVERY_MESSAGE_BYTES)
         || !identities_valid
         || !valid_digest(&request.artifact_sha256)
@@ -1227,6 +1423,35 @@ async fn handle_worker_realization(
                 )
                 .await;
             }
+            // v9 only: the canonical variable payload follows the artifact
+            // bytes on the same connection. It is fully read, digest-checked,
+            // and structurally validated before any Worker starts; a truncated
+            // or corrupted payload fails here, never as a partial environment.
+            let vars = if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V9 {
+                let payload_bytes = request
+                    .variable_payload_bytes
+                    .expect("validated variable payload length");
+                let expected_sha256 = request
+                    .variable_payload_sha256
+                    .as_deref()
+                    .expect("validated variable payload digest");
+                match read_validated_variable_payload(&mut stream, payload_bytes, expected_sha256)
+                    .await
+                {
+                    Some(vars) => vars,
+                    None => {
+                        return write_json(
+                            &mut stream,
+                            &Rejection {
+                                error: "authentication_rejected",
+                            },
+                        )
+                        .await;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let source = match String::from_utf8(artifact) {
                 Ok(source) => source,
                 Err(_) => {
@@ -1250,7 +1475,7 @@ async fn handle_worker_realization(
                 queue_bindings: Vec::new(),
                 queue_consumers: Vec::new(),
                 workflow_bindings: Vec::new(),
-                vars: Vec::new(),
+                vars,
                 node: "base-worker-control".to_owned(),
                 modules: Vec::new(),
                 compat: Compat::default(),
@@ -1431,6 +1656,9 @@ async fn handle_worker_realization(
 /// Maps only authenticated, closed protocol combinations to celld's private
 /// bootstrap selector. v4 has no profile fields and remains Default forever;
 /// v5 currently admits only the deliberately narrow BaseWorker contract.
+/// v9 admits exactly the same profile/contract pairs as the v6-v8 delivery
+/// family: configuration transport changes what the Worker may read, never
+/// which bootstrap it runs under.
 fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRuntimeProfile> {
     match (
         request.protocol_version,
@@ -1438,10 +1666,14 @@ fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRunti
         request.execution_contract.as_deref(),
     ) {
         (WORKER_REALIZATION_PROTOCOL_VERSION_V4, None, None) => Some(WorkerRuntimeProfile::Default),
+        // v9 carries configuration but no bootstrap selector: the default
+        // target establishes exactly as its v4 predecessor did.
+        (WORKER_REALIZATION_PROTOCOL_VERSION_V9, None, None) => Some(WorkerRuntimeProfile::Default),
         (
             WORKER_REALIZATION_PROTOCOL_VERSION_V6
             | WORKER_REALIZATION_PROTOCOL_VERSION_V7
-            | WORKER_REALIZATION_PROTOCOL_VERSION_V8,
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V8
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V9,
             Some("default"),
             Some("base-worker/celld-browser-esm-v1"),
         ) => Some(WorkerRuntimeProfile::Default),
@@ -1453,7 +1685,8 @@ fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRunti
         (
             WORKER_REALIZATION_PROTOCOL_VERSION_V6
             | WORKER_REALIZATION_PROTOCOL_VERSION_V7
-            | WORKER_REALIZATION_PROTOCOL_VERSION_V8,
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V8
+            | WORKER_REALIZATION_PROTOCOL_VERSION_V9,
             Some("base-worker"),
             Some(BASE_WORKER_PROFILE_CONTRACT),
         ) => Some(WorkerRuntimeProfile::BaseWorker),
@@ -1502,6 +1735,7 @@ async fn write_worker_realization_response(
         branch_id: &request.branch_id,
         cell_id: &request.cell_id,
         artifact_sha256: &request.artifact_sha256,
+        configuration_digest: request.configuration_digest.as_deref(),
         local_presence,
         status,
         headers: headers.clone(),
@@ -1761,6 +1995,83 @@ fn valid_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// Reads exactly `payload_bytes` of variable payload from the establishment
+/// connection, then digest-checks and structurally validates it. Any short
+/// read, timeout, digest mismatch, or structural defect yields `None`: the
+/// caller must fail the establishment without starting a Worker. A complete
+/// but invalid payload is consumed in full first so the connection is never
+/// left holding unread attacker bytes for a subsequent request.
+async fn read_validated_variable_payload(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    payload_bytes: usize,
+    expected_sha256: &str,
+) -> Option<Vec<(String, String)>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut payload = vec![0_u8; payload_bytes];
+    if !matches!(
+        tokio::time::timeout(WORKER_EXECUTION_TIMEOUT, stream.read_exact(&mut payload)).await,
+        Ok(Ok(_))
+    ) {
+        return None;
+    }
+    if hex::encode(Sha256::digest(&payload)) != expected_sha256 {
+        return None;
+    }
+    validated_establishment_vars(&payload)
+}
+
+/// Validates a v9 canonical variable payload: a JSON array of
+/// `[name, value]` string pairs in strictly ascending name order, within the
+/// same bounds Base enforces on immutable Version configuration. Returns the
+/// validated pairs, or `None` when the payload must not become a Worker
+/// environment. Logs nothing about the payload contents: variable values are
+/// application data, not diagnostics.
+fn validated_establishment_vars(payload: &[u8]) -> Option<Vec<(String, String)>> {
+    if payload.len() > MAX_VARIABLE_PAYLOAD_BYTES {
+        return None;
+    }
+    if payload.is_empty() {
+        return None;
+    }
+    let vars: Vec<(String, String)> = serde_json::from_slice(payload).ok()?;
+    if vars.len() > MAX_VARIABLE_COUNT {
+        return None;
+    }
+    // Canonical order doubles as the duplicate check: equal neighbours are
+    // not strictly ascending.
+    if vars.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return None;
+    }
+    for (name, value) in &vars {
+        if !valid_variable_name(name) || !valid_variable_value(value) {
+            return None;
+        }
+    }
+    // The payload must be byte-identical to its own canonical encoding.
+    // Anything else (whitespace, escapes, key order tricks) is rejected even
+    // when it parses to the same pairs.
+    if serde_json::to_vec(&vars).ok().as_deref() != Some(payload) {
+        return None;
+    }
+    Some(vars)
+}
+
+fn valid_variable_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_VARIABLE_NAME_BYTES
+        && name.bytes().enumerate().all(|(index, byte)| {
+            if index == 0 {
+                byte.is_ascii_alphabetic() || byte == b'_'
+            } else {
+                byte.is_ascii_alphanumeric() || byte == b'_'
+            }
+        })
+}
+
+fn valid_variable_value(value: &str) -> bool {
+    value.len() <= MAX_VARIABLE_VALUE_BYTES && !value.contains('\0')
+}
+
 fn valid_internal_method(value: &str) -> bool {
     matches!(
         value,
@@ -1985,6 +2296,34 @@ fn worker_execution_response_material(
 }
 
 fn worker_realization_request_material(request: &WorkerRealizationRequest) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V9 {
+        return canonical_material(
+            "establish-worker-realization-request-v9",
+            &[
+                &request.protocol,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                &request
+                    .artifact_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.version_id.as_deref().unwrap_or(""),
+                request.configuration_digest.as_deref().unwrap_or(""),
+                &request
+                    .variable_payload_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.variable_payload_sha256.as_deref().unwrap_or(""),
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                &request.nonce,
+            ],
+        );
+    }
     if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V8 {
         let headers = header_material(request.headers.as_deref().unwrap_or_default());
         return canonical_material(
@@ -2109,6 +2448,31 @@ fn worker_realization_response_material(
     body_sha256: Option<String>,
     body_bytes: Option<usize>,
 ) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V9 {
+        return canonical_material(
+            "establish-worker-realization-response-v9",
+            &[
+                PROTOCOL,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                installation_id,
+                "celld",
+                implementation_version,
+                process_instance_id,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                request.configuration_digest.as_deref().unwrap_or(""),
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                local_presence,
+                &request.nonce,
+            ],
+        );
+    }
     if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V8 {
         let request_headers = header_material(request.headers.as_deref().unwrap_or_default());
         let response_headers = header_material(headers);
@@ -2446,6 +2810,10 @@ mod tests {
             body_sha256: None,
             profile: Some("base-worker".to_owned()),
             execution_contract: Some(BASE_WORKER_PROFILE_CONTRACT.to_owned()),
+            version_id: None,
+            configuration_digest: None,
+            variable_payload_bytes: None,
+            variable_payload_sha256: None,
             nonce: "0123456789abcdef0123456789abcdef".to_owned(),
             proof: String::new(),
         }
@@ -2881,5 +3249,202 @@ mod tests {
             ),
             &proof,
         ));
+    }
+
+    #[test]
+    fn establishment_vars_accept_a_canonical_payload() {
+        let payload = br#"[["APP_ENV","production"],["FEATURE_FLAG","on"]]"#;
+        let vars = validated_establishment_vars(payload).expect("canonical payload");
+        assert_eq!(
+            vars,
+            vec![
+                ("APP_ENV".to_owned(), "production".to_owned()),
+                ("FEATURE_FLAG".to_owned(), "on".to_owned()),
+            ]
+        );
+        assert_eq!(
+            validated_establishment_vars(br#"[]"#).expect("empty canonical payload"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn establishment_vars_reject_malformed_payloads() {
+        // Empty bytes carry no parseable value.
+        assert!(validated_establishment_vars(b"").is_none());
+        // Truncated JSON never becomes a partial environment.
+        assert!(validated_establishment_vars(br#"[["APP_ENV","pro"#).is_none());
+        // Non-string values are not ordinary variables.
+        assert!(validated_establishment_vars(br#"[["APP_ENV",1]]"#).is_none());
+        // Duplicates and unsorted names break the canonical order.
+        assert!(validated_establishment_vars(br#"[["B","1"],["A","2"]]"#).is_none());
+        assert!(validated_establishment_vars(br#"[["A","1"],["A","2"]]"#).is_none());
+        // Invalid names, embedded NULs, and oversized values fail.
+        assert!(validated_establishment_vars(br#"[["9LIVES","x"]]"#).is_none());
+        assert!(validated_establishment_vars(br#"[["APP_ENV","has\u0000nul"]]"#).is_none());
+        let oversized = format!(r#"[["APP_ENV","{}"]]"#, "x".repeat(8 * 1024 + 1));
+        assert!(validated_establishment_vars(oversized.as_bytes()).is_none());
+        let long_name = format!(r#"[["{}","x"]]"#, "A".repeat(129));
+        assert!(validated_establishment_vars(long_name.as_bytes()).is_none());
+        // Non-canonical encodings (whitespace) are rejected even when they
+        // parse to the same pairs.
+        assert!(validated_establishment_vars(br#"[ ["APP_ENV", "x"] ]"#).is_none());
+        // More than 128 variables are rejected.
+        let mut many = String::from("[");
+        for index in 0..129 {
+            if index > 0 {
+                many.push(',');
+            }
+            many.push_str(&format!(r#"["VAR_{index:03}","x"]"#));
+        }
+        many.push(']');
+        assert!(validated_establishment_vars(many.as_bytes()).is_none());
+        // An oversized payload frame is rejected before parsing.
+        assert!(validated_establishment_vars(&vec![b'x'; 64 * 1024 + 1]).is_none());
+    }
+
+    #[tokio::test]
+    async fn variable_payload_read_rejects_truncation_and_digest_mismatch() {
+        use tokio::io::{duplex, AsyncWriteExt as _};
+        let payload = br#"[["APP_ENV","production"]]"#;
+        let good_sha = hex::encode(Sha256::digest(payload));
+        // Complete, digest-matching read validates.
+        let (mut client, mut server) = duplex(1024);
+        client.write_all(payload).await.expect("write payload");
+        client.shutdown().await.expect("finish");
+        let vars = read_validated_variable_payload(&mut server, payload.len(), &good_sha).await;
+        assert_eq!(
+            vars,
+            Some(vec![("APP_ENV".to_owned(), "production".to_owned())])
+        );
+        // Truncated delivery never becomes a partial environment.
+        let (mut client, mut server) = duplex(1024);
+        client
+            .write_all(&payload[..payload.len() - 4])
+            .await
+            .expect("write prefix");
+        drop(client);
+        assert!(
+            read_validated_variable_payload(&mut server, payload.len(), &good_sha)
+                .await
+                .is_none()
+        );
+        // Fully delivered but digest-mismatched bytes are rejected.
+        let (mut client, mut server) = duplex(1024);
+        client.write_all(payload).await.expect("write payload");
+        client.shutdown().await.expect("finish");
+        assert!(
+            read_validated_variable_payload(&mut server, payload.len(), &"0".repeat(64),)
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn v9_request_material_binds_configuration_fields() {
+        let request = WorkerRealizationRequest {
+            operation: "establishWorkerRealization".to_owned(),
+            protocol: PROTOCOL.to_owned(),
+            protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION_V9,
+            realization_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            project_id: "11234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            worker_id: "21234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            branch_id: "31234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            cell_id: "41234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            artifact_sha256: "ab3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            artifact_bytes: Some(16),
+            url: None,
+            method: None,
+            path_and_query: None,
+            request_url: None,
+            content_type: None,
+            headers: None,
+            body_bytes: None,
+            body_sha256: None,
+            profile: None,
+            execution_contract: None,
+            version_id: Some("51234567-89ab-cdef-0123-456789abcdef".to_owned()),
+            configuration_digest: Some(
+                "cd3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            ),
+            variable_payload_bytes: Some(24),
+            variable_payload_sha256: Some(
+                "de3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            ),
+            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            proof: String::new(),
+        };
+        let material = worker_realization_request_material(&request);
+        let mut tampered = request.clone();
+        tampered.configuration_digest =
+            Some("ff3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned());
+        assert_ne!(worker_realization_request_material(&tampered), material);
+        let mut legacy = request.clone();
+        legacy.protocol_version = WORKER_REALIZATION_PROTOCOL_VERSION_V4;
+        assert_ne!(worker_realization_request_material(&legacy), material);
+    }
+
+    #[test]
+    fn v9_response_material_binds_configuration_digest_echo() {
+        let request = WorkerRealizationRequest {
+            operation: "establishWorkerRealization".to_owned(),
+            protocol: PROTOCOL.to_owned(),
+            protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION_V9,
+            realization_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            project_id: "11234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            worker_id: "21234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            branch_id: "31234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            cell_id: "41234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            artifact_sha256: "ab3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+            artifact_bytes: Some(16),
+            url: None,
+            method: None,
+            path_and_query: None,
+            request_url: None,
+            content_type: None,
+            headers: None,
+            body_bytes: None,
+            body_sha256: None,
+            profile: None,
+            execution_contract: None,
+            version_id: Some("51234567-89ab-cdef-0123-456789abcdef".to_owned()),
+            configuration_digest: Some(
+                "cd3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            ),
+            variable_payload_bytes: Some(24),
+            variable_payload_sha256: Some(
+                "de3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            ),
+            nonce: "0123456789abcdef0123456789abcdef".to_owned(),
+            proof: String::new(),
+        };
+        let material = worker_realization_response_material(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "test",
+            "61234567-89ab-cdef-0123-456789abcdef",
+            &request,
+            "accepting",
+            None,
+            &[],
+            None,
+            None,
+        );
+        let mut tampered = request.clone();
+        tampered.configuration_digest =
+            Some("ff3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned());
+        let tampered_material = worker_realization_response_material(
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "test",
+            "61234567-89ab-cdef-0123-456789abcdef",
+            &tampered,
+            "accepting",
+            None,
+            &[],
+            None,
+            None,
+        );
+        assert_ne!(tampered_material, material);
     }
 }
