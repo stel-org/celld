@@ -57,13 +57,21 @@ const WORKER_REALIZATION_PROTOCOL_VERSION_V5: u32 = 5;
 /// Bounded request delivery to an already retained realization. v4 and v5
 /// remain historical lifecycle protocols and are never reinterpreted.
 const WORKER_REALIZATION_PROTOCOL_VERSION_V6: u32 = 6;
+/// Authenticated buffered HTTP delivery. It is advertised only by the explicit
+/// capability operation below once this receiver is present.
+const WORKER_REALIZATION_PROTOCOL_VERSION_V7: u32 = 7;
 const BASE_WORKER_PROFILE_CONTRACT: &str = "base-worker/celld-base-worker-esm-v1";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_HTTP_DELIVERY_MESSAGE_BYTES: usize = 128 * 1024;
 const MAX_WORKER_ARTIFACT_BYTES: usize = 512 * 1024;
 const MAX_WORKER_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_WORKER_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const MAX_WORKER_REQUEST_PATH_BYTES: usize = 2_048;
 const MAX_WORKER_CONTENT_TYPE_BYTES: usize = 256;
+const MAX_HTTP_HEADERS: usize = 64;
+const MAX_HTTP_HEADER_NAME_BYTES: usize = 128;
+const MAX_HTTP_HEADER_VALUE_BYTES: usize = 4 * 1024;
+const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const EXECUTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -158,6 +166,8 @@ struct WorkerRealizationRequest {
     #[serde(default)]
     content_type: Option<String>,
     #[serde(default)]
+    headers: Option<Vec<HttpHeaderFrame>>,
+    #[serde(default)]
     body_bytes: Option<usize>,
     #[serde(default)]
     body_sha256: Option<String>,
@@ -166,6 +176,37 @@ struct WorkerRealizationRequest {
     #[serde(default)]
     execution_contract: Option<String>,
     nonce: String,
+    proof: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct HttpHeaderFrame {
+    name: String,
+    value_base64: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeliveryCapabilityRequest {
+    operation: String,
+    protocol: String,
+    protocol_version: u32,
+    nonce: String,
+    proof: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryCapabilityResponse<'a> {
+    operation: &'static str,
+    protocol: &'static str,
+    protocol_version: u32,
+    installation_id: &'a str,
+    implementation: &'static str,
+    implementation_version: &'static str,
+    supported_versions: [u32; 1],
+    nonce: &'a str,
     proof: String,
 }
 
@@ -246,6 +287,8 @@ struct WorkerRealizationResponse<'a> {
     artifact_sha256: &'a str,
     local_presence: &'a str,
     status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<Vec<HttpHeaderFrame>>,
     body_base64: Option<String>,
     body_sha256: Option<String>,
     body_bytes: Option<usize>,
@@ -554,6 +597,7 @@ async fn handle_control(
             replay_guard,
             realizations,
             value,
+            body.len(),
         )
         .await;
     }
@@ -616,7 +660,17 @@ async fn handle_execution(
     replay_guard: Arc<ReplayGuard>,
     realizations: Arc<WorkerRealizationRegistry>,
     value: serde_json::Value,
+    frame_bytes: usize,
 ) -> anyhow::Result<()> {
+    if value.get("operation").and_then(serde_json::Value::as_str)
+        == Some("inspectWorkerHttpDelivery")
+    {
+        let request: DeliveryCapabilityRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(_) => return Ok(()),
+        };
+        return handle_http_delivery_capability(stream, installation_id, secret, request).await;
+    }
     if value.get("operation").and_then(serde_json::Value::as_str) == Some("executeWorker") {
         let request: WorkerExecutionRequest = match serde_json::from_value(value) {
             Ok(request) => request,
@@ -648,6 +702,7 @@ async fn handle_execution(
             replay_guard,
             realizations,
             request,
+            frame_bytes,
         )
         .await;
     }
@@ -811,6 +866,75 @@ async fn handle_worker_execution(
     .context("Base Worker execution timed out")?
 }
 
+/// Non-executing v7 capability discovery. It does not touch the realization
+/// registry, replay guard, application runtime, or actor state.
+async fn handle_http_delivery_capability(
+    mut stream: UnixStream,
+    installation_id: &str,
+    secret: &[u8],
+    request: DeliveryCapabilityRequest,
+) -> anyhow::Result<()> {
+    if request.operation != "inspectWorkerHttpDelivery"
+        || request.protocol != PROTOCOL
+        || request.protocol_version != WORKER_REALIZATION_PROTOCOL_VERSION_V7
+        || !valid_nonce(&request.nonce)
+        || !verify(
+            secret,
+            &canonical_material(
+                "worker-realization-http-capability-request-v7",
+                &[
+                    PROTOCOL,
+                    &WORKER_REALIZATION_PROTOCOL_VERSION_V7.to_string(),
+                    "inspectWorkerHttpDelivery",
+                    &request.nonce,
+                ],
+            ),
+            &request.proof,
+        )
+    {
+        return write_json(
+            &mut stream,
+            &Rejection {
+                error: "authentication_rejected",
+            },
+        )
+        .await;
+    }
+    let supported_versions = [WORKER_REALIZATION_PROTOCOL_VERSION_V7];
+    let versions = supported_versions
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let response = DeliveryCapabilityResponse {
+        operation: "inspectWorkerHttpDelivery",
+        protocol: PROTOCOL,
+        protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION_V7,
+        installation_id,
+        implementation: "celld",
+        implementation_version: env!("CARGO_PKG_VERSION"),
+        supported_versions,
+        nonce: &request.nonce,
+        proof: sign(
+            secret,
+            &canonical_material(
+                "worker-realization-http-capability-response-v7",
+                &[
+                    PROTOCOL,
+                    &WORKER_REALIZATION_PROTOCOL_VERSION_V7.to_string(),
+                    "inspectWorkerHttpDelivery",
+                    installation_id,
+                    "celld",
+                    env!("CARGO_PKG_VERSION"),
+                    &versions,
+                    &request.nonce,
+                ],
+            ),
+        ),
+    };
+    write_json(&mut stream, &response).await
+}
+
 async fn execute_worker_artifact(
     stream: &mut UnixStream,
     installation_id: &str,
@@ -916,6 +1040,7 @@ async fn handle_worker_realization(
     replay_guard: Arc<ReplayGuard>,
     realizations: Arc<WorkerRealizationRegistry>,
     request: WorkerRealizationRequest,
+    frame_bytes: usize,
 ) -> anyhow::Result<()> {
     let supported = matches!(
         request.operation.as_str(),
@@ -947,7 +1072,7 @@ async fn handle_worker_realization(
                 && request.method.as_deref() == Some("GET")
         }
         "dispatchWorkerRealization" => {
-            request.artifact_bytes.is_none()
+            let common = request.artifact_bytes.is_none()
                 && request.url.is_none()
                 && request.method.as_deref().is_some_and(valid_internal_method)
                 && request
@@ -955,13 +1080,25 @@ async fn handle_worker_realization(
                     .as_deref()
                     .is_some_and(valid_internal_path)
                 && request
-                    .content_type
-                    .as_deref()
-                    .is_none_or(valid_content_type)
-                && request
                     .body_bytes
                     .is_some_and(|bytes| bytes <= MAX_WORKER_REQUEST_BODY_BYTES)
-                && request.body_sha256.as_deref().is_some_and(valid_digest)
+                && request.body_sha256.as_deref().is_some_and(valid_digest);
+            if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
+                common
+                    && request.content_type.is_none()
+                    && request.headers.as_deref().is_some_and(valid_http_headers)
+            } else {
+                common
+                    && request.headers.is_none()
+                    && request
+                        .content_type
+                        .as_deref()
+                        .is_none_or(valid_content_type)
+                    && matches!(
+                        request.method.as_deref(),
+                        Some("GET" | "POST" | "PUT" | "PATCH" | "DELETE")
+                    )
+            }
         }
         "inspectWorkerRealization" | "retireWorkerRealization" => {
             request.artifact_bytes.is_none() && request.url.is_none() && request.method.is_none()
@@ -970,7 +1107,10 @@ async fn handle_worker_realization(
     };
     let protocol_shape = match request.operation.as_str() {
         "dispatchWorkerRealization" => {
-            request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V6
+            matches!(
+                request.protocol_version,
+                WORKER_REALIZATION_PROTOCOL_VERSION_V6 | WORKER_REALIZATION_PROTOCOL_VERSION_V7
+            )
         }
         _ => matches!(
             request.protocol_version,
@@ -980,6 +1120,10 @@ async fn handle_worker_realization(
     if !supported
         || request.protocol != PROTOCOL
         || !protocol_shape
+        || (request.protocol_version != WORKER_REALIZATION_PROTOCOL_VERSION_V7
+            && frame_bytes > MAX_MESSAGE_BYTES)
+        || (request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7
+            && frame_bytes > MAX_HTTP_DELIVERY_MESSAGE_BYTES)
         || !identities_valid
         || !valid_digest(&request.artifact_sha256)
         || !artifact_shape
@@ -1107,10 +1251,10 @@ async fn handle_worker_realization(
                     .establish(metadata.clone(), runtime)
                     .map_err(Into::into)
             }) {
-                Ok(()) => ("accepting", None, None),
+                Ok(()) => ("accepting", None, None, None),
                 Err(error) => {
                     tracing::warn!(error = %error, "Base Worker realization establishment refused");
-                    ("refused", None, None)
+                    ("refused", None, None, None)
                 }
             }
         }
@@ -1126,12 +1270,17 @@ async fn handle_worker_realization(
             .and_then(|response| {
                 bounded_response(response, MAX_WORKER_RESPONSE_BYTES).map_err(InvokeError::Runtime)
             }) {
-            Ok(response) => ("accepting", Some(response.status), Some(response.body)),
-            Err(InvokeError::Absent) => ("absent", None, None),
-            Err(InvokeError::Retiring) => ("retiring", None, None),
+            Ok(response) => (
+                "accepting",
+                Some(response.status),
+                Some(response.body),
+                None,
+            ),
+            Err(InvokeError::Absent) => ("absent", None, None, None),
+            Err(InvokeError::Retiring) => ("retiring", None, None, None),
             Err(InvokeError::Runtime(error)) => {
                 tracing::warn!(%error, "Base Worker realization invocation refused");
-                ("refused", None, None)
+                ("refused", None, None, None)
             }
         },
         "dispatchWorkerRealization" => {
@@ -1151,12 +1300,29 @@ async fn handle_worker_realization(
                 )
                 .await;
             }
-            let headers = request
-                .content_type
-                .as_ref()
-                .map_or_else(Vec::new, |value| {
-                    vec![("content-type".to_owned(), value.clone())]
-                });
+            let headers = if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
+                match decode_execution_headers(
+                    request.headers.as_deref().expect("validated headers"),
+                ) {
+                    Ok(headers) => headers,
+                    Err(()) => {
+                        return write_json(
+                            &mut stream,
+                            &Rejection {
+                                error: "authentication_rejected",
+                            },
+                        )
+                        .await
+                    }
+                }
+            } else {
+                request
+                    .content_type
+                    .as_ref()
+                    .map_or_else(Vec::new, |value| {
+                        vec![("content-type".to_owned(), value.clone())]
+                    })
+            };
             let url = format!(
                 "https://base.local{}",
                 request.path_and_query.as_deref().expect("validated path")
@@ -1174,28 +1340,49 @@ async fn handle_worker_realization(
                     bounded_response(response, MAX_WORKER_RESPONSE_BYTES)
                         .map_err(InvokeError::Runtime)
                 }) {
-                Ok(response) => ("accepting", Some(response.status), Some(response.body)),
-                Err(InvokeError::Absent) => ("absent", None, None),
-                Err(InvokeError::Retiring) => ("retiring", None, None),
+                Ok(response) => {
+                    let headers = (request.protocol_version
+                        == WORKER_REALIZATION_PROTOCOL_VERSION_V7)
+                        .then(|| encode_response_headers(&response.headers));
+                    if !(100..=599).contains(&response.status)
+                        || headers
+                            .as_deref()
+                            .is_some_and(|headers| !valid_http_headers(headers))
+                    {
+                        tracing::warn!(
+                            "Base Worker realization produced invalid HTTP response headers"
+                        );
+                        ("refused", None, None, Some(Vec::new()))
+                    } else {
+                        (
+                            "accepting",
+                            Some(response.status),
+                            Some(response.body),
+                            headers,
+                        )
+                    }
+                }
+                Err(InvokeError::Absent) => ("absent", None, None, None),
+                Err(InvokeError::Retiring) => ("retiring", None, None, None),
                 Err(InvokeError::Runtime(error)) => {
                     tracing::warn!(%error, "Base Worker realization bounded dispatch refused");
-                    ("refused", None, None)
+                    ("refused", None, None, None)
                 }
             }
         }
         "inspectWorkerRealization" => match realizations.inspect(&request.realization_id) {
             Some((actual, LocalPresence::Accepting)) if actual == metadata => {
-                ("accepting", None, None)
+                ("accepting", None, None, None)
             }
             Some((actual, LocalPresence::Retiring)) if actual == metadata => {
-                ("retiring", None, None)
+                ("retiring", None, None, None)
             }
-            _ => ("absent", None, None),
+            _ => ("absent", None, None, None),
         },
         "retireWorkerRealization" => match realizations.retire(&metadata).await {
-            RetireResult::Retired => ("retired", None, None),
-            RetireResult::Retiring => ("retiring", None, None),
-            RetireResult::Absent => ("absent", None, None),
+            RetireResult::Retired => ("retired", None, None, None),
+            RetireResult::Retiring => ("retiring", None, None, None),
+            RetireResult::Absent => ("absent", None, None, None),
         },
         _ => unreachable!("validated operation"),
     };
@@ -1208,6 +1395,7 @@ async fn handle_worker_realization(
         outcome.0,
         outcome.1,
         outcome.2,
+        outcome.3,
     )
     .await
 }
@@ -1223,7 +1411,7 @@ fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRunti
     ) {
         (WORKER_REALIZATION_PROTOCOL_VERSION_V4, None, None) => Some(WorkerRuntimeProfile::Default),
         (
-            WORKER_REALIZATION_PROTOCOL_VERSION_V6,
+            WORKER_REALIZATION_PROTOCOL_VERSION_V6 | WORKER_REALIZATION_PROTOCOL_VERSION_V7,
             Some("default"),
             Some("base-worker/celld-browser-esm-v1"),
         ) => Some(WorkerRuntimeProfile::Default),
@@ -1233,7 +1421,7 @@ fn realization_profile(request: &WorkerRealizationRequest) -> Option<WorkerRunti
             Some(BASE_WORKER_PROFILE_CONTRACT),
         ) => Some(WorkerRuntimeProfile::BaseWorker),
         (
-            WORKER_REALIZATION_PROTOCOL_VERSION_V6,
+            WORKER_REALIZATION_PROTOCOL_VERSION_V6 | WORKER_REALIZATION_PROTOCOL_VERSION_V7,
             Some("base-worker"),
             Some(BASE_WORKER_PROFILE_CONTRACT),
         ) => Some(WorkerRuntimeProfile::BaseWorker),
@@ -1254,7 +1442,13 @@ async fn write_worker_realization_response(
     local_presence: &str,
     status: Option<u16>,
     body: Option<Vec<u8>>,
+    headers: Option<Vec<HttpHeaderFrame>>,
 ) -> anyhow::Result<()> {
+    let headers = if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
+        Some(headers.unwrap_or_default())
+    } else {
+        headers
+    };
     let body_base64 = body
         .as_ref()
         .map(|value| base64::engine::general_purpose::STANDARD.encode(value));
@@ -1278,6 +1472,7 @@ async fn write_worker_realization_response(
         artifact_sha256: &request.artifact_sha256,
         local_presence,
         status,
+        headers: headers.clone(),
         body_base64,
         body_sha256,
         body_bytes,
@@ -1293,6 +1488,7 @@ async fn write_worker_realization_response(
                 request,
                 local_presence,
                 status,
+                headers.as_deref().unwrap_or_default(),
                 response_body_sha256(&body),
                 body.as_ref().map(Vec::len),
             ),
@@ -1497,7 +1693,7 @@ async fn read_message(stream: &mut UnixStream) -> anyhow::Result<Vec<u8>> {
         if byte[0] == b'\n' {
             return Ok(body);
         }
-        if body.len() == MAX_MESSAGE_BYTES {
+        if body.len() == MAX_HTTP_DELIVERY_MESSAGE_BYTES {
             bail!("Base control request exceeds its maximum size");
         }
         body.push(byte[0]);
@@ -1534,7 +1730,117 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn valid_internal_method(value: &str) -> bool {
-    matches!(value, "GET" | "POST" | "PUT" | "PATCH" | "DELETE")
+    matches!(
+        value,
+        "GET" | "HEAD" | "OPTIONS" | "POST" | "PUT" | "PATCH" | "DELETE"
+    )
+}
+
+fn valid_http_headers(headers: &[HttpHeaderFrame]) -> bool {
+    if headers.len() > MAX_HTTP_HEADERS {
+        return false;
+    }
+    let mut total = 0_usize;
+    for header in headers {
+        if header.name.is_empty()
+            || header.name.len() > MAX_HTTP_HEADER_NAME_BYTES
+            || !header.name.bytes().all(is_header_name_byte)
+            || forbidden_header_name(&header.name)
+        {
+            return false;
+        }
+        let Ok(value) = base64::engine::general_purpose::STANDARD.decode(&header.value_base64)
+        else {
+            return false;
+        };
+        if value.len() > MAX_HTTP_HEADER_VALUE_BYTES || !valid_header_value(&value) {
+            return false;
+        }
+        total = total
+            .saturating_add(header.name.len())
+            .saturating_add(value.len());
+        if total > MAX_HTTP_HEADER_BYTES {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_header_value(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|byte| *byte == b'\t' || (*byte >= b' ' && *byte != 0x7f))
+}
+
+/// The established StatelessRuntime receives header strings. v7 carries bytes
+/// to preserve the wire contract, so non-UTF-8 values are rejected here rather
+/// than changed by a lossy conversion. Valid UTF-8 values retain their exact
+/// bytes when passed to the runtime.
+fn decode_execution_headers(headers: &[HttpHeaderFrame]) -> Result<Vec<(String, String)>, ()> {
+    if !valid_http_headers(headers) {
+        return Err(());
+    }
+    headers
+        .iter()
+        .map(|header| {
+            let value = base64::engine::general_purpose::STANDARD
+                .decode(&header.value_base64)
+                .map_err(|_| ())?;
+            let value = String::from_utf8(value).map_err(|_| ())?;
+            Ok((header.name.clone(), value))
+        })
+        .collect()
+}
+
+fn encode_response_headers(headers: &[(String, String)]) -> Vec<HttpHeaderFrame> {
+    headers
+        .iter()
+        .map(|(name, value)| HttpHeaderFrame {
+            name: name.clone(),
+            value_base64: base64::engine::general_purpose::STANDARD.encode(value.as_bytes()),
+        })
+        .collect()
+}
+
+fn is_header_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn forbidden_header_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("x-forwarded-")
+        || matches!(
+            name.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "proxy-connection"
+                | "host"
+                | "content-length"
+                | "forwarded"
+        )
 }
 
 fn valid_internal_path(value: &str) -> bool {
@@ -1623,6 +1929,33 @@ fn worker_execution_response_material(
 }
 
 fn worker_realization_request_material(request: &WorkerRealizationRequest) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
+        let headers = header_material(request.headers.as_deref().unwrap_or_default());
+        return canonical_material(
+            "dispatch-worker-realization-request-v7",
+            &[
+                &request.protocol,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                request.method.as_deref().unwrap_or(""),
+                request.path_and_query.as_deref().unwrap_or(""),
+                &headers,
+                &request
+                    .body_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.body_sha256.as_deref().unwrap_or(""),
+                &request.nonce,
+            ],
+        );
+    }
     if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V6 {
         return canonical_material(
             "dispatch-worker-realization-request-v6",
@@ -1688,9 +2021,47 @@ fn worker_realization_response_material(
     request: &WorkerRealizationRequest,
     local_presence: &str,
     status: Option<u16>,
+    headers: &[HttpHeaderFrame],
     body_sha256: Option<String>,
     body_bytes: Option<usize>,
 ) -> String {
+    if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V7 {
+        let request_headers = header_material(request.headers.as_deref().unwrap_or_default());
+        let response_headers = header_material(headers);
+        return canonical_material(
+            "dispatch-worker-realization-response-v7",
+            &[
+                PROTOCOL,
+                &request.protocol_version.to_string(),
+                &request.operation,
+                installation_id,
+                "celld",
+                implementation_version,
+                process_instance_id,
+                &request.realization_id,
+                &request.project_id,
+                &request.worker_id,
+                &request.branch_id,
+                &request.cell_id,
+                &request.artifact_sha256,
+                request.profile.as_deref().unwrap_or(""),
+                request.execution_contract.as_deref().unwrap_or(""),
+                request.method.as_deref().unwrap_or(""),
+                request.path_and_query.as_deref().unwrap_or(""),
+                &request_headers,
+                &request
+                    .body_bytes
+                    .map_or_else(String::new, |value| value.to_string()),
+                request.body_sha256.as_deref().unwrap_or(""),
+                local_presence,
+                &status.map_or_else(String::new, |value| value.to_string()),
+                &response_headers,
+                body_sha256.as_deref().unwrap_or(""),
+                &body_bytes.map_or_else(String::new, |value| value.to_string()),
+                &request.nonce,
+            ],
+        );
+    }
     if request.protocol_version == WORKER_REALIZATION_PROTOCOL_VERSION_V6 {
         return canonical_material(
             "dispatch-worker-realization-response-v6",
@@ -1749,6 +2120,15 @@ fn worker_realization_response_material(
         request.profile.as_deref().unwrap_or(""),
         request.execution_contract.as_deref().unwrap_or("")
     )
+}
+
+fn header_material(headers: &[HttpHeaderFrame]) -> String {
+    let mut fields = Vec::with_capacity(headers.len().saturating_mul(2));
+    for header in headers {
+        fields.push(header.name.as_str());
+        fields.push(header.value_base64.as_str());
+    }
+    canonical_material("worker-realization-http-headers-v1", &fields)
 }
 
 fn canonical_material(label: &str, fields: &[&str]) -> String {
@@ -1826,6 +2206,7 @@ fn verify(secret: &[u8], material: &str, proof: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
 
     #[test]
     fn request_proof_is_bound_to_its_nonce() {
@@ -1937,6 +2318,7 @@ mod tests {
             method: None,
             path_and_query: None,
             content_type: None,
+            headers: None,
             body_bytes: None,
             body_sha256: None,
             profile: Some("base-worker".to_owned()),
@@ -2010,6 +2392,285 @@ mod tests {
         assert!(valid_internal_path("/valid/path?x=%2F"));
         assert!(!valid_internal_path("//host/path"));
         assert!(!valid_internal_path("/a/../b"));
+    }
+
+    fn dispatch_v7_request() -> WorkerRealizationRequest {
+        let mut request = profile_request();
+        request.operation = "dispatchWorkerRealization".to_owned();
+        request.protocol_version = WORKER_REALIZATION_PROTOCOL_VERSION_V7;
+        request.profile = Some("default".to_owned());
+        request.execution_contract = Some("base-worker/celld-browser-esm-v1".to_owned());
+        request.artifact_bytes = None;
+        request.method = Some("POST".to_owned());
+        request.path_and_query = Some("/api/orders?source=web".to_owned());
+        request.content_type = None;
+        request.headers = Some(vec![
+            HttpHeaderFrame {
+                name: "content-type".to_owned(),
+                value_base64: base64::engine::general_purpose::STANDARD.encode(b"application/json"),
+            },
+            HttpHeaderFrame {
+                name: "authorization".to_owned(),
+                value_base64: base64::engine::general_purpose::STANDARD.encode(b"Bearer example"),
+            },
+            HttpHeaderFrame {
+                name: "cookie".to_owned(),
+                value_base64: base64::engine::general_purpose::STANDARD.encode(b"session=abc"),
+            },
+            HttpHeaderFrame {
+                name: "accept".to_owned(),
+                value_base64: base64::engine::general_purpose::STANDARD.encode(b"application/json"),
+            },
+        ]);
+        request.body_bytes = Some(14);
+        request.body_sha256 = Some(hex::encode(Sha256::digest(br#"{"quantity":2}"#)));
+        request
+    }
+
+    #[test]
+    fn dispatch_v7_proof_binds_ordered_headers_and_rejects_invalid_values() {
+        let secret = [9_u8; 32];
+        let request = dispatch_v7_request();
+        let proof = sign(&secret, &worker_realization_request_material(&request));
+        assert!(verify(
+            &secret,
+            &worker_realization_request_material(&request),
+            &proof
+        ));
+        assert!(request.headers.as_deref().is_some_and(valid_http_headers));
+        let mut reordered = request.clone();
+        reordered.headers.as_mut().expect("headers").swap(0, 1);
+        assert!(!verify(
+            &secret,
+            &worker_realization_request_material(&reordered),
+            &proof
+        ));
+        let mut altered = request.clone();
+        altered.headers.as_mut().expect("headers")[1].value_base64 =
+            base64::engine::general_purpose::STANDARD.encode(b"Bearer altered");
+        assert!(!verify(
+            &secret,
+            &worker_realization_request_material(&altered),
+            &proof
+        ));
+        let invalid = vec![HttpHeaderFrame {
+            name: "x-test".to_owned(),
+            value_base64: base64::engine::general_purpose::STANDARD.encode(b"ok\r\ninjected"),
+        }];
+        assert!(!valid_http_headers(&invalid));
+        let invalid_base64 = vec![HttpHeaderFrame {
+            name: "x-test".to_owned(),
+            value_base64: "not base64!".to_owned(),
+        }];
+        assert!(!valid_http_headers(&invalid_base64));
+        let forbidden = vec![HttpHeaderFrame {
+            name: "host".to_owned(),
+            value_base64: base64::engine::general_purpose::STANDARD.encode(b"forged.example"),
+        }];
+        assert!(!valid_http_headers(&forbidden));
+        let non_utf8 = vec![HttpHeaderFrame {
+            name: "x-bytes".to_owned(),
+            value_base64: base64::engine::general_purpose::STANDARD.encode([0xff]),
+        }];
+        assert!(valid_http_headers(&non_utf8));
+        assert!(decode_execution_headers(&non_utf8).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_capability_is_signed_and_non_executing() {
+        let secret = [3_u8; 32];
+        let nonce = "0123456789abcdef0123456789abcdef".to_owned();
+        let request = DeliveryCapabilityRequest {
+            operation: "inspectWorkerHttpDelivery".to_owned(),
+            protocol: PROTOCOL.to_owned(),
+            protocol_version: WORKER_REALIZATION_PROTOCOL_VERSION_V7,
+            nonce: nonce.clone(),
+            proof: sign(
+                &secret,
+                &canonical_material(
+                    "worker-realization-http-capability-request-v7",
+                    &[
+                        PROTOCOL,
+                        &WORKER_REALIZATION_PROTOCOL_VERSION_V7.to_string(),
+                        "inspectWorkerHttpDelivery",
+                        &nonce,
+                    ],
+                ),
+            ),
+        };
+        let (mut client, server) = UnixStream::pair().expect("UDS pair");
+        client.shutdown().await.expect("request finish");
+        handle_http_delivery_capability(
+            server,
+            "01234567-89ab-cdef-0123-456789abcdef",
+            &secret,
+            request,
+        )
+        .await
+        .expect("capability response");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("response");
+        let response: serde_json::Value =
+            serde_json::from_slice(response.strip_suffix(b"\n").expect("newline"))
+                .expect("response JSON");
+        assert_eq!(response["supportedVersions"], serde_json::json!([7]));
+        assert!(verify(
+            &secret,
+            &canonical_material(
+                "worker-realization-http-capability-response-v7",
+                &[
+                    PROTOCOL,
+                    "7",
+                    "inspectWorkerHttpDelivery",
+                    response["installationId"].as_str().expect("installation"),
+                    "celld",
+                    response["implementationVersion"].as_str().expect("version"),
+                    "7",
+                    &nonce,
+                ],
+            ),
+            response["proof"].as_str().expect("proof"),
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn v7_receiver_executes_a_real_retained_worker_with_http_headers() {
+        static V8: Once = Once::new();
+        V8.call_once(crate::runtime::init_v8);
+        crate::asyncrt::set_host_handle(tokio::runtime::Handle::current());
+        let source = r#"
+            export default {
+              async fetch(request) {
+                const body = await request.text();
+                const headers = new Headers();
+                headers.set("Content-Type", "application/json");
+                headers.set("Location", "/api/orders/123");
+                headers.append("Set-Cookie", "session=abc; HttpOnly");
+                headers.append("Set-Cookie", "preference=dark");
+                return new Response(JSON.stringify({
+                  method: request.method,
+                  target: new URL(request.url).pathname + new URL(request.url).search,
+                  authorization: request.headers.get("authorization"),
+                  cookie: request.headers.get("cookie"), body,
+                }), { status: 201, headers });
+              }
+            };
+        "#;
+        let config = WorkerConfig::new(WorkerConfigOptions {
+            src: source.to_owned(),
+            script_name: "base-control-v7-test".to_owned(),
+            do_classes: Vec::new(),
+            bindings: Vec::new(),
+            r2_bindings: Vec::new(),
+            d1_bindings: Vec::new(),
+            kv_bindings: Vec::new(),
+            queue_bindings: Vec::new(),
+            queue_consumers: Vec::new(),
+            workflow_bindings: Vec::new(),
+            vars: Vec::new(),
+            node: "base-control-test".to_owned(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        })
+        .with_runtime_profile(WorkerRuntimeProfile::Default);
+        let runtime = StatelessRuntime::start(
+            Arc::new(config),
+            Arc::from("test-node"),
+            Arc::from("test-region"),
+        )
+        .expect("real StatelessRuntime");
+        let registry = Arc::new(WorkerRealizationRegistry::default());
+        let request = dispatch_v7_request();
+        let metadata = RealizationMetadata {
+            realization_id: request.realization_id.clone(),
+            project_id: request.project_id.clone(),
+            worker_id: request.worker_id.clone(),
+            branch_id: request.branch_id.clone(),
+            cell_id: request.cell_id.clone(),
+            artifact_sha256: request.artifact_sha256.clone(),
+            runtime_profile: "default".to_owned(),
+            execution_contract: "base-worker/celld-browser-esm-v1".to_owned(),
+        };
+        registry
+            .establish(metadata, runtime)
+            .expect("retained realization");
+        let secret = [7_u8; 32];
+        let mut request = request;
+        request.proof = sign(&secret, &worker_realization_request_material(&request));
+        let sent_request = request.clone();
+        let (mut client, server) = UnixStream::pair().expect("UDS pair");
+        client.write_all(b"{\"quantity\":2}").await.expect("body");
+        client.shutdown().await.expect("body finish");
+        handle_worker_realization(
+            server,
+            "01234567-89ab-cdef-0123-456789abcdef",
+            &secret,
+            Path::new("/tmp/base-workload.sock"),
+            "fedcba98-7654-3210-fedc-ba9876543210",
+            Arc::new(ReplayGuard::default()),
+            registry,
+            request,
+            4 * 1024,
+        )
+        .await
+        .expect("handler result");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.expect("response");
+        let response: serde_json::Value =
+            serde_json::from_slice(response.strip_suffix(b"\n").expect("newline"))
+                .expect("response JSON");
+        assert_eq!(response["protocolVersion"], 7);
+        assert_eq!(response["status"], 201);
+        let headers: Vec<HttpHeaderFrame> =
+            serde_json::from_value(response["headers"].clone()).expect("response headers");
+        assert_eq!(
+            headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("set-cookie"))
+                .count(),
+            2
+        );
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("content-type")
+                && base64::engine::general_purpose::STANDARD
+                    .decode(&header.value_base64)
+                    .as_deref()
+                    == Ok(b"application/json".as_slice())
+        }));
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("location")
+                && base64::engine::general_purpose::STANDARD
+                    .decode(&header.value_base64)
+                    .as_deref()
+                    == Ok(b"/api/orders/123".as_slice())
+        }));
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(response["bodyBase64"].as_str().expect("body"))
+            .expect("body base64");
+        let body = String::from_utf8(body).expect("body UTF-8");
+        assert!(body.contains("\"method\":\"POST\""));
+        assert!(body.contains("/api/orders?source=web"));
+        assert!(body.contains("Bearer example"));
+        assert!(body.contains("session=abc"));
+        assert!(verify(
+            &secret,
+            &worker_realization_response_material(
+                response["installationId"].as_str().expect("installation"),
+                response["implementationVersion"]
+                    .as_str()
+                    .expect("implementation version"),
+                response["processInstanceId"]
+                    .as_str()
+                    .expect("process instance"),
+                &sent_request,
+                response["localPresence"].as_str().expect("presence"),
+                response["status"].as_u64().map(|status| status as u16),
+                &headers,
+                response["bodySha256"].as_str().map(ToOwned::to_owned),
+                response["bodyBytes"].as_u64().map(|bytes| bytes as usize),
+            ),
+            response["proof"].as_str().expect("proof"),
+        ));
     }
 
     #[test]

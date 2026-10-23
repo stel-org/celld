@@ -133,6 +133,68 @@ secret stop ordinary other-user access and unauthenticated responders. A process
 with equivalent Unix account and filesystem authority that can read the secret
 is already inside the pairing boundary.
 
+## R8.2-C authenticated HTTP realization delivery
+
+`dispatchWorkerRealization` version 7 is the bounded HTTP successor to v6. It
+does not establish, select or replace a realization. After authentication, the
+control adapter derives `RealizationMetadata` from the signed identity,
+artifact, profile and execution-contract fields, and invokes only a matching,
+already accepting `WorkerRealizationRegistry` entry. That registry remains the
+single owner of the retained `StatelessRuntime`, admission and retirement
+logic; v7 adds no dispatcher, runtime or lifecycle.
+
+Base first sends a non-executing `inspectWorkerHttpDelivery` v7 capability
+request. Its proof covers the protocol, version, operation and nonce under
+`worker-realization-http-capability-request-v7`. celld responds with its
+installation, implementation/version, `[7]` supported delivery version and
+the original nonce under
+`worker-realization-http-capability-response-v7`. The probe does not inspect,
+allocate, activate or execute a Worker, and v7 is advertised only by this
+implemented receiver.
+
+The v7 dispatch metadata contains the existing realization identity and
+admission facts plus method, origin-free path/query, an ordered `headers`
+array, body length/digest and nonce. A header is represented as:
+
+```json
+{ "name": "authorization", "valueBase64": "QmVhcmVyIGV4YW1wbGU=" }
+```
+
+The request proof is the fixed-order length-prefixed
+`dispatch-worker-realization-request-v7` material. The header sub-material is
+`worker-realization-http-headers-v1`, containing each name and base64 value in
+wire order. No repeated field is merged. The receiver allows `GET`, `HEAD`,
+`OPTIONS`, `POST`, `PUT`, `PATCH` and `DELETE`; limits request targets to 2,048
+bytes, header fields to 64, names to 128 bytes, values to 4 KiB, aggregate
+header bytes to 16 KiB, and buffered request/response bodies to 64 KiB. Its v7
+metadata line is bounded to 128 KiB.
+
+Before execution celld rejects invalid base64, invalid names/values, CR/LF or
+other header injection, hop-by-hop headers, `Host`, `Content-Length`,
+`Forwarded` and `X-Forwarded-*`; it reads exactly the signed body length and
+checks SHA-256. The response includes explicit `headers` (including `[]`) and
+is signed with `dispatch-worker-realization-response-v7`, binding request
+headers, response status, response headers and response body facts. Duplicate
+response fields, including `Set-Cookie`, retain their order.
+
+The existing Worker host accepts `Vec<(String, String)>` headers. celld decodes
+the binary-safe wire value losslessly only when it is valid UTF-8, then passes
+it unchanged through `WorkerRealizationRegistry::invoke()` to the existing
+`StatelessRuntime`. A non-UTF-8 request value is rejected rather than lossy
+converted. Worker response values are host strings and are encoded directly to
+base64 after the same HTTP validation. Streaming bodies, SSE and WebSockets are
+not part of this receiver. A future R8.3 binary-header host interface must be a
+compatible execution contract change, not a silent reinterpretation here.
+
+The focused receiver proof establishes a real retained `StatelessRuntime` and
+uses the v7 handler over a Unix stream. Its Worker verifies a JSON POST's
+method, path/query, `Authorization`, `Cookie` and body, then returns `201`,
+JSON `Content-Type`, `Location`, two independent `Set-Cookie` fields and a
+JSON body. The test verifies the complete response HMAC material. Base's
+isolated `prove-worker-realization.sh` process proof additionally starts this
+celld binary with a temporary pairing directory, establishes a Worker through
+the Base Worker compiler, and completes that v7 request through Base Runtime.
+
 ## B3.8.6 verified Base Workload Binding bridge
 
 Base-managed retained realizations receive a celld host capability distinct

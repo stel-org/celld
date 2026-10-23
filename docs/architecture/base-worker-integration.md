@@ -226,6 +226,25 @@ A subsequent integration can reuse `JsrLocked` when it has product-owned
 source selection and lockfile lifecycle semantics. It must continue to keep
 Base Worker responsible for preparation and celld responsible for execution.
 
+## R8.2-C retained HTTP delivery
+
+The paired Base control adapter now receives `base-celld` v7 buffered HTTP
+delivery for an existing retained Worker realization. This is an adapter around
+the established `WorkerRealizationRegistry::invoke()` path: request method,
+path/query, body and ordered headers pass to its existing `StatelessRuntime`,
+and the resulting status, field-line headers and bytes return through the
+authenticated response. It is not a second JavaScript runtime or a public HTTP
+listener.
+
+v7 uses ordered `{name, valueBase64}` fields and authenticates them with the
+same length-prefixed header material Base uses. Values that the existing string
+host cannot represent as UTF-8 are rejected before invocation, never lossy
+converted. Buffered request/response bodies are limited to 64 KiB; streaming,
+SSE and WebSockets remain R8.3 work. The focused test in
+`base_control::tests::v7_receiver_executes_a_real_retained_worker_with_http_headers`
+executes a real retained Worker and proves its `201`, JSON `Content-Type`,
+`Location`, repeated `Set-Cookie` fields and response proof.
+
 ## B3.2.1 Base-defined Worker invocation
 
 B3.2.1 consumes the existing artifact boundary from a separately built Base
